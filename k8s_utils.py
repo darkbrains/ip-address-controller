@@ -1,4 +1,4 @@
-from kubernetes import client
+
 import traceback
 
 def list_nodes(v1_client, label_selector, logger=None, crd_name=""):
