@@ -1,46 +1,54 @@
 from kubernetes import client
 import traceback
 
-def list_nodes(v1_client, label_selector, logger):
+def list_nodes(v1_client, label_selector, logger=None, crd_name=""):
     try:
-        selector = ",".join([f"{k}={v}" for k, v in label_selector.items()])
+        selector = ",".join([f"{k}={v}" for k,v in label_selector.items()])
         nodes = v1_client.list_node(label_selector=selector).items
-        node_names = [n.metadata.name for n in nodes]
-        zones = [n.metadata.labels.get("topology.kubernetes.io/zone", "") for n in nodes]
-        logger.info("Listed nodes in pool", extra={"nodes": node_names, "zone": zones})
+        if logger:
+            logger.set_context(crd=crd_name)
+            logger.info("Listed nodes in pool", extra={"nodes": [n.metadata.name for n in nodes]})
         return nodes
     except Exception:
         tb = traceback.format_exc()
-        logger.error("Failed to list nodes", extra={"trace": tb})
+        if logger:
+            logger.set_context(crd=crd_name, trace=tb)
+            logger.error("Failed to list nodes")
         raise
 
-def patch_node_label(v1_client, node_name, labels, logger):
+def patch_node_label(v1_client, node_name, labels, logger=None, crd_name=""):
     try:
-        body = {"metadata": {"labels": labels}}
+        body = {"metadata":{"labels": labels}}
         v1_client.patch_node(node_name, body)
-        logger.info("Patched node labels", extra={"node": node_name, "labels": labels})
+        if logger:
+            logger.set_context(crd=crd_name, node=node_name)
+            logger.info("Patched node labels", extra={"labels": labels})
     except Exception:
         tb = traceback.format_exc()
-        logger.error("Failed to patch node labels", extra={"node": node_name, "labels": labels, "trace": tb})
+        if logger:
+            logger.set_context(crd=crd_name, node=node_name, trace=tb)
+            logger.error("Failed to patch node labels")
         raise
 
-def patch_deployment_strategy(apps_v1_client, deployment_ref, strategy, logger):
+def patch_deployment_strategy(apps_v1_client, deployment_ref, strategy, logger=None, crd_name=""):
     try:
-        dep_name = deployment_ref.get('name')
-        dep_namespace = deployment_ref.get('namespace', 'default')
-        dep = apps_v1_client.read_namespaced_deployment(dep_name, dep_namespace)
+        dep_name = deployment_ref.get("name")
+        dep_ns = deployment_ref.get("namespace", "default")
+        dep = apps_v1_client.read_namespaced_deployment(dep_name, dep_ns)
 
-        if dep.spec.strategy.type is None:
-            dep.spec.strategy.type = "RollingUpdate"
+        patched = False
+        if dep.spec.strategy.type != strategy.get("type"):
+            dep.spec.strategy.type = strategy.get("type")
+            apps_v1_client.patch_namespaced_deployment(dep_name, dep_ns, dep)
+            patched = True
 
-        rolling_update = dep.spec.strategy.rolling_update or client.V1RollingUpdateDeployment()
-        rolling_update.max_surge = strategy.get("maxSurge", rolling_update.max_surge)
-        rolling_update.max_unavailable = strategy.get("maxUnavailable", rolling_update.max_unavailable)
-
-        dep.spec.strategy.rolling_update = rolling_update
-        apps_v1_client.patch_namespaced_deployment(dep_name, dep_namespace, dep)
-        logger.info("Patched deployment strategy", extra={"deployment": dep_name, "strategy": strategy})
+        if logger:
+            logger.set_context(crd=crd_name, node="", ip="", zone="")
+            logger.info("Patched deployment strategy" if patched else "Deployment strategy already matches CRD")
     except Exception:
         tb = traceback.format_exc()
-        logger.error("Failed to patch deployment strategy", extra={"deployment": deployment_ref.get('name'), "trace": tb})
+        if logger:
+            logger.set_context(crd=crd_name, trace=tb)
+            logger.error("Failed to patch deployment strategy")
         raise
+
