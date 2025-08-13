@@ -1,117 +1,93 @@
 import time
-import logging
 import traceback
-from cloud import gcp_attach_ip, gcp_node_has_ip
 from k8s_utils import list_nodes, patch_node_label, patch_deployment_strategy
+from cloud.gcp import attach_ip_to_node, node_has_ip, get_gcp_credentials
 
 CRD_GROUP = "netinfra.darkbrains.com"
 CRD_VERSION = "v1alpha1"
 CRD_PLURAL = "netipallocations"
 RECONCILE_INTERVAL_DEFAULT = 30  # seconds
 
-# ---------------- Structured Logger ----------------
-logger = logging.getLogger("ip-address-controller")
-handler = logging.StreamHandler()
-formatter = logging.Formatter(
-    'ts=%(asctime)s level=%(levelname)s msg="%(message)s"'
-)
-handler.setFormatter(formatter)
-logger.addHandler(handler)
-logger.setLevel(logging.INFO)
-
-# ---------------- Reconcile Functions ----------------
-def reconcile(crd, v1_client, apps_v1_client):
-    name = crd['metadata']['name']
-    namespace = crd['metadata'].get('namespace', 'default')
-    spec = crd['spec']
-
-    reserved_ips = spec['reservedIPs']
+def reconcile(crd, v1_client, apps_v1_client, logger):
+    name = crd['metadata'].get('name', '')
+    spec = crd.get('spec', {})
+    reserved_ips = spec.get('reservedIPs', [])
     node_selector = spec.get('nodeSelector', {})
-    deployment_ref = spec['deploymentRef']
-    cloud_spec = spec['cloud']
+    deployment_ref = spec.get('deploymentRef', {})
+    cloud_spec = spec.get('cloud', {})
     strategy = spec.get("strategy", {})
 
-    logger.info(f"Reconciling CRD",
-                extra={"crd_name": name, "namespace": namespace})
+    logger.info("Reconciling CRD", extra={"crd_name": name})
 
-    # 1. List nodes in pool
-    try:
-        nodes = list_nodes(v1_client, node_selector)
-        node_names = [n.metadata.name for n in nodes]
-        logger.info("Nodes in pool",
-                    extra={"nodes": node_names, "crd_name": name})
-    except Exception as e:
-        tb = traceback.format_exc().replace("\n", " | ")
-        logger.error("Failed to list nodes",
-                     extra={"error": str(e), "trace": tb, "crd_name": name})
-        return
+    creds, project = get_gcp_credentials()
+    nodes = list_nodes(v1_client, node_selector, logger)
+    node_names = [n.metadata.name for n in nodes]
+    logger.info("Nodes in pool", extra={"crd_name": name, "node": node_names})
 
-    # 2. Attach IPs and label nodes
     assigned_nodes = {}
     free_nodes = set(node_names)
+
     for ip in reserved_ips:
         attached = False
+        logger.info("Processing reserved IP", extra={"crd_name": name, "ip": ip})
+
         for node in nodes:
-            if gcp_node_has_ip(node, ip, cloud_spec):
-                assigned_nodes[ip] = node.metadata.name
-                free_nodes.discard(node.metadata.name)
-                attached = True
-                break
+            try:
+                if node_has_ip(node, ip, cloud_spec, creds, project):
+                    assigned_nodes[ip] = node.metadata.name
+                    free_nodes.discard(node.metadata.name)
+                    attached = True
+                    logger.info("IP already attached to node", extra={
+                        "crd_name": name, "ip": ip, "node": node.metadata.name,
+                        "zone": node.metadata.labels.get("topology.kubernetes.io/zone", "")
+                    })
+                    break
+            except Exception:
+                tb = traceback.format_exc()
+                logger.error("Error checking IP", extra={"crd_name": name, "ip": ip, "node": node.metadata.name, "trace": tb})
 
         if not attached:
             if not free_nodes:
-                logger.warning("No free nodes available for IP",
-                               extra={"ip": ip, "crd_name": name})
+                logger.warning("No free nodes available for IP", extra={"crd_name": name, "ip": ip})
                 continue
             target_node = free_nodes.pop()
             try:
-                gcp_attach_ip(cloud_spec, ip, target_node)
-                patch_node_label(v1_client, target_node, {"ip.ready": "true"})
+                attach_ip_to_node(cloud_spec, ip, target_node, creds, project, crd_name=name)
+                patch_node_label(v1_client, target_node, {"ip.ready": "true"}, logger)
                 assigned_nodes[ip] = target_node
-                logger.info("IP attached and node labeled ip.ready",
-                            extra={"node": target_node, "ip": ip, "crd_name": name})
-            except Exception as e:
-                tb = traceback.format_exc().replace("\n", " | ")
-                logger.error("Failed to attach IP or label node",
-                             extra={"ip": ip, "node": target_node, "error": str(e), "trace": tb, "crd_name": name})
+                logger.info("IP attached and node labeled ip.ready", extra={"crd_name": name, "ip": ip, "node": target_node})
+            except Exception:
+                tb = traceback.format_exc()
+                logger.error("Error attaching IP to node", extra={"crd_name": name, "ip": ip, "node": target_node, "trace": tb})
 
-    # 3. Patch Deployment strategy only
+    # Patch deployment strategy
     try:
-        patch_deployment_strategy(apps_v1_client, deployment_ref, strategy)
-        logger.info("Patched deployment strategy",
-                    extra={"deployment": deployment_ref['name'], "strategy": strategy, "crd_name": name})
-    except Exception as e:
-        tb = traceback.format_exc().replace("\n", " | ")
-        logger.error("Failed to patch deployment strategy",
-                     extra={"deployment": deployment_ref['name'], "error": str(e), "trace": tb, "crd_name": name})
+        patch_deployment_strategy(apps_v1_client, deployment_ref, strategy, logger)
+        logger.info("Patched deployment strategy", extra={"crd_name": name})
+    except Exception:
+        tb = traceback.format_exc()
+        logger.error("Failed to patch deployment strategy", extra={"crd_name": name, "trace": tb})
 
-
-def reconcile_all(v1_client, apps_v1_client, crd_api_client):
+def reconcile_all(v1_client, apps_v1_client, crd_api_client, logger):
     last_reconcile = {}
-
     while True:
         try:
-            crds = crd_api_client.list_cluster_custom_object(
-                CRD_GROUP, CRD_VERSION, CRD_PLURAL
-            )['items']
-        except Exception as e:
-            tb = traceback.format_exc().replace("\n", " | ")
-            logger.error("Failed to list CRDs",
-                         extra={"error": str(e), "trace": tb})
+            crds = crd_api_client.list_cluster_custom_object(CRD_GROUP, CRD_VERSION, CRD_PLURAL).get('items', [])
+        except Exception:
+            tb = traceback.format_exc()
+            logger.error("Failed to list CRDs", extra={"trace": tb})
             time.sleep(10)
             continue
 
         now = time.time()
         for crd in crds:
-            interval = crd['spec'].get('reconcileInterval', RECONCILE_INTERVAL_DEFAULT)
-            last = last_reconcile.get(crd['metadata']['name'], 0)
+            interval = crd.get('spec', {}).get('reconcileInterval', RECONCILE_INTERVAL_DEFAULT)
+            last = last_reconcile.get(crd['metadata'].get('name'), 0)
             if now - last >= interval:
                 try:
-                    reconcile(crd, v1_client, apps_v1_client)
-                    last_reconcile[crd['metadata']['name']] = now
-                except Exception as e:
-                    tb = traceback.format_exc().replace("\n", " | ")
-                    logger.error("Error during reconcile",
-                                 extra={"crd_name": crd['metadata']['name'], "error": str(e), "trace": tb})
-
+                    reconcile(crd, v1_client, apps_v1_client, logger)
+                    last_reconcile[crd['metadata'].get('name')] = now
+                except Exception:
+                    tb = traceback.format_exc()
+                    logger.error("Error during reconcile", extra={"crd_name": crd['metadata'].get('name'), "trace": tb})
         time.sleep(5)

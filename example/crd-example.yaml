@@ -15,6 +15,10 @@ spec:
   cloud:
     provider: gcp
     region: us-east1
+    zones:
+      - us-east1-d
+      - us-east1-b
+      - us-east1-c
   strategy:
     maxSurge: 1
     maxUnavailable: 0

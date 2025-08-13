@@ -16,6 +16,6 @@ spec:
       serviceAccountName: ip-address-controller-sa
       containers:
         - name: ip-address-controller
-          image: darkbrains/ip-address-controller:v6
+          image: darkbrains/ip-address-controller:v9
           imagePullPolicy: Always
           resources: {}

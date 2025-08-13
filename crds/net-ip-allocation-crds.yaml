@@ -37,6 +37,10 @@ spec:
                       type: string
                     region:
                       type: string
+                    zones:
+                      type: array
+                      items:
+                        type: string
                 strategy:
                   type: object
                   properties:
