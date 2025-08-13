@@ -3,12 +3,19 @@ import logging
 import traceback
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 from google.auth import default
 from kubernetes import client as k8s_client
-
+from google.auth.transport.requests import Request
 logger = logging.getLogger("ip-address-controller")
+
+
+from googleapiclient.discovery import build
+
+def build_compute_service(creds):
+    # Just pass credentials, no httplib2 needed
+    service = build("compute", "v1", credentials=creds)
+    return service
 
 
 def get_gcp_credentials():
@@ -34,14 +41,14 @@ def get_gcp_credentials():
         raise
 
 
-def node_has_ip(node, ip, creds=None, project=None):
+def node_has_ip(node, ip, creds=None, project=None, crd_name=""):
     """Check if a node already has this IP attached."""
     try:
         if creds is None or project is None:
             creds, project = get_gcp_credentials()
         zone = node.metadata.labels.get("topology.kubernetes.io/zone", "")
         instance_name = node.metadata.name
-        service = build("compute", "v1", credentials=creds)
+        service = build_compute_service(creds)
 
         instance = service.instances().get(project=project, zone=zone, instance=instance_name).execute()
         for iface in instance.get("networkInterfaces", []):
@@ -52,47 +59,47 @@ def node_has_ip(node, ip, creds=None, project=None):
     except HttpError:
         tb = traceback.format_exc()
         logger.error("GCP API error checking IP", extra={
-            "node": node.metadata.name, "ip": ip, "zone": zone, "trace": tb
+            "crd_name": crd_name, "node": node.metadata.name, "ip": ip, "zone": zone, "trace": tb
         })
         return False
     except Exception:
         tb = traceback.format_exc()
         logger.error("Unexpected error in node_has_ip", extra={
-            "node": node.metadata.name, "ip": ip, "zone": zone, "trace": tb
+            "crd_name": crd_name, "node": node.metadata.name, "ip": ip, "zone": zone, "trace": tb
         })
         return False
 
 
 def attach_ip_to_node(ip, node_name, creds=None, project=None, crd_name=""):
-    """Attach a static public IP to a GKE node."""
+    """Attach a static external IP to a GKE node safely."""
     try:
         if creds is None or project is None:
             creds, project = get_gcp_credentials()
+
         v1 = k8s_client.CoreV1Api()
         node = v1.read_node(node_name)
         zone = node.metadata.labels.get("topology.kubernetes.io/zone", "")
+        service = build_compute_service(creds)
 
-        service = build("compute", "v1", credentials=creds)
+        # Get the instance and NIC
         instance = service.instances().get(project=project, zone=zone, instance=node_name).execute()
-        iface_name = instance["networkInterfaces"][0]["name"]
-        access_configs = instance["networkInterfaces"][0].get("accessConfigs", [])
+        iface = instance["networkInterfaces"][0]
+        iface_name = iface["name"]
+        access_configs = iface.get("accessConfigs", [])
 
-        # Update existing NAT
+        # Delete existing ONE_TO_ONE_NAT if present
         for ac in access_configs:
             if ac["type"] == "ONE_TO_ONE_NAT":
-                ac["natIP"] = ip
-                service.instances().updateAccessConfig(
+                service.instances().deleteAccessConfig(
                     project=project,
                     zone=zone,
                     instance=node_name,
                     networkInterface=iface_name,
-                    accessConfig=ac["name"],
-                    body=ac
+                    accessConfig=ac["name"]
                 ).execute()
-                logger.info("Updated existing NAT with static IP", extra={"crd_name": crd_name, "node": node_name, "ip": ip, "zone": zone})
-                return
+                break  # remove first NAT, only one external IP per NIC in GKE
 
-        # Insert new NAT if none
+        # Add the static external IP
         body = {"name": "external-nat", "type": "ONE_TO_ONE_NAT", "natIP": ip}
         service.instances().addAccessConfig(
             project=project,
@@ -101,8 +108,11 @@ def attach_ip_to_node(ip, node_name, creds=None, project=None, crd_name=""):
             networkInterface=iface_name,
             body=body
         ).execute()
-        logger.info("Added new NAT access config with static IP", extra={"crd_name": crd_name, "node": node_name, "ip": ip, "zone": zone})
-    except HttpError:
+
+        logger.info("Attached static external IP successfully",
+                    extra={"crd_name": crd_name, "node": node_name, "ip": ip, "zone": zone, "trace": tb})
+
+    except HttpError as e:
         tb = traceback.format_exc()
         logger.error("GCP API error attaching IP", extra={"crd_name": crd_name, "node": node_name, "ip": ip, "zone": zone, "trace": tb})
         raise
@@ -113,11 +123,10 @@ def attach_ip_to_node(ip, node_name, creds=None, project=None, crd_name=""):
 
 
 def detach_ip_from_node(ip, node_name, v1_client, creds=None, project=None, crd_name="", controller_label="app"):
-    """Detach a static public IP from a GKE node if it is drained."""
+    from reconciler import is_node_drained
+
     node = v1_client.read_node(node_name)
 
-    # Only detach if node is drained
-    from reconciler import is_node_drained
     if not is_node_drained(node, v1_client, controller_label=controller_label):
         logger.info(f"Node {node_name} is not drained; skipping IP detach", extra={"crd_name": crd_name})
         return
@@ -125,9 +134,9 @@ def detach_ip_from_node(ip, node_name, v1_client, creds=None, project=None, crd_
     try:
         if creds is None or project is None:
             creds, project = get_gcp_credentials()
-
         zone = node.metadata.labels.get("topology.kubernetes.io/zone", "")
-        service = build("compute", "v1", credentials=creds)
+        service = build_compute_service(creds)
+
         instance = service.instances().get(project=project, zone=zone, instance=node_name).execute()
         iface = instance["networkInterfaces"][0]
         access_configs = iface.get("accessConfigs", [])
@@ -141,16 +150,20 @@ def detach_ip_from_node(ip, node_name, v1_client, creds=None, project=None, crd_
                     networkInterface=iface["name"],
                     accessConfig=ac["name"]
                 ).execute()
-                logger.info("Detached NAT access config", extra={"crd_name": crd_name, "node": node_name, "ip": ip, "zone": zone})
+                logger.info("Detached NAT access config",
+                            extra={"crd_name": crd_name, "node": node_name, "ip": ip, "zone": zone, "trace": tb})
                 return
 
-        logger.info("IP not found on node; nothing to detach", extra={"crd_name": crd_name, "node": node_name, "ip": ip, "zone": zone})
+        logger.info("IP not found on node; nothing to detach",
+                    extra={"crd_name": crd_name, "node": node_name, "ip": ip, "zone": zone, "trace": tb})
 
     except HttpError:
         tb = traceback.format_exc()
-        logger.error("GCP API error detaching IP", extra={"crd_name": crd_name, "node": node_name, "ip": ip, "zone": zone, "trace": tb})
+        logger.error("GCP API error detaching IP",
+                     extra={"crd_name": crd_name, "node": node_name, "ip": ip, "zone": zone, "trace": tb})
         raise
     except Exception:
         tb = traceback.format_exc()
-        logger.error("Unexpected error in detach_ip_from_node", extra={"crd_name": crd_name, "node": node_name, "ip": ip, "zone": zone, "trace": tb})
+        logger.error("Unexpected error in detach_ip_from_node",
+                     extra={"crd_name": crd_name, "node": node_name, "ip": ip, "zone": zone, "trace": tb})
         raise
