@@ -1,0 +1,21 @@
+apiVersion: netinfra.darkbrains.com/v1alpha1
+kind: NetIPAllocation
+metadata:
+  name: temp-pool-ips
+  namespace: test
+spec:
+  reservedIPs:
+    - 104.196.101.157
+    - 34.23.73.36
+  nodeSelector:
+    role: temp-pool
+  deploymentRef:
+    name: temp-pool
+    namespace: test
+  cloud:
+    provider: gcp
+    region: us-east1
+  strategy:
+    maxSurge: 1
+    maxUnavailable: 0
+  reconcileInterval: 15

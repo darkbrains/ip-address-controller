@@ -1,20 +1,24 @@
 from kubernetes import client
+import logging
 
-apps_v1 = client.AppsV1Api()
-v1 = client.CoreV1Api()
+logger = logging.getLogger("ip-address-controller")
 
-def list_nodes(label_selector):
-    selector = ",".join([f"{k}={v}" for k,v in label_selector.items()])
-    return v1.list_node(label_selector=selector).items
+def list_nodes(v1_client, label_selector):
+    selector = ",".join([f"{k}={v}" for k, v in label_selector.items()])
+    nodes = v1_client.list_node(label_selector=selector).items
+    node_names = [n.metadata.name for n in nodes]
+    logger.info(f"Listed nodes in pool", extra={"nodes": node_names})
+    return nodes
 
-def patch_node_label(node_name, labels):
+def patch_node_label(v1_client, node_name, labels):
     body = {"metadata": {"labels": labels}}
-    v1.patch_node(node_name, body)
+    v1_client.patch_node(node_name, body)
+    logger.info(f"Patched node labels", extra={"node": node_name, "labels": labels})
 
-def patch_deployment_strategy(deployment_ref, strategy):
+def patch_deployment_strategy(apps_v1_client, deployment_ref, strategy):
     dep_name = deployment_ref['name']
     dep_namespace = deployment_ref['namespace']
-    dep = apps_v1.read_namespaced_deployment(dep_name, dep_namespace)
+    dep = apps_v1_client.read_namespaced_deployment(dep_name, dep_namespace)
 
     if dep.spec.strategy.type is None:
         dep.spec.strategy.type = "RollingUpdate"
@@ -24,4 +28,5 @@ def patch_deployment_strategy(deployment_ref, strategy):
     rolling_update.max_unavailable = strategy.get("maxUnavailable", rolling_update.max_unavailable)
 
     dep.spec.strategy.rolling_update = rolling_update
-    apps_v1.patch_namespaced_deployment(dep_name, dep_namespace, dep)
+    apps_v1_client.patch_namespaced_deployment(dep_name, dep_namespace, dep)
+    logger.info("Patched deployment strategy", extra={"deployment": dep_name, "strategy": strategy})

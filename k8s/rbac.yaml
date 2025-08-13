@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ip-address-controller-sa
+  namespace: test
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ip-address-controller-role
+rules:
+  # Watch / list / get CRDs
+  - apiGroups: ["netinfra.darkbrains.com"]
+    resources: ["netipallocations"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+
+  # Read / list / patch nodes
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+
+  # Read / patch Deployments
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ip-address-controller-binding
+subjects:
+  - kind: ServiceAccount
+    name: ip-address-controller-sa
+    namespace: test
+roleRef:
+  kind: ClusterRole
+  name: ip-address-controller-role
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temp-pool
+  namespace: test
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: temp-pool
+  template:
+    metadata:
+      labels:
+        app: temp-pool
+    spec:
+      hostNetwork: true
+      nodeSelector:
+        ip.ready: "true"
+      tolerations:
+        - key: "role"
+          operator: "Equal"
+          value: "temp-pool"
+          effect: "PreferNoSchedule"
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - temp-pool
+              topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: temp-pool
+          image: nginx:latest
+          resources: {}

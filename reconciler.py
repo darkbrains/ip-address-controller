@@ -1,32 +1,28 @@
 import time
 import logging
-from kubernetes import client as k8s_client
+import traceback
+from cloud import gcp_attach_ip, gcp_node_has_ip
 from k8s_utils import list_nodes, patch_node_label, patch_deployment_strategy
-from cloud import attach_ip
 
 CRD_GROUP = "netinfra.darkbrains.com"
 CRD_VERSION = "v1alpha1"
-CRD_PLURAL = "reservedipdeployments"
-
-crd_api = k8s_client.CustomObjectsApi()
-
+CRD_PLURAL = "netipallocations"
 RECONCILE_INTERVAL_DEFAULT = 30  # seconds
-last_reconcile = {}
 
-# Structured key-value logging
+# ---------------- Structured Logger ----------------
 logger = logging.getLogger("ip-address-controller")
 handler = logging.StreamHandler()
 formatter = logging.Formatter(
-    '{"ts": "%(asctime)s", "level": "%(levelname)s", "msg": "%(message)s"}'
+    'ts=%(asctime)s level=%(levelname)s msg="%(message)s"'
 )
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-
-def reconcile(crd):
+# ---------------- Reconcile Functions ----------------
+def reconcile(crd, v1_client, apps_v1_client):
     name = crd['metadata']['name']
-    namespace = crd['metadata']['namespace']
+    namespace = crd['metadata'].get('namespace', 'default')
     spec = crd['spec']
 
     reserved_ips = spec['reservedIPs']
@@ -35,64 +31,87 @@ def reconcile(crd):
     cloud_spec = spec['cloud']
     strategy = spec.get("strategy", {})
 
-    logger.info(f"Reconciling CRD", extra={"crd_name": name, "namespace": namespace})
+    logger.info(f"Reconciling CRD",
+                extra={"crd_name": name, "namespace": namespace})
 
     # 1. List nodes in pool
-    nodes = list_nodes(node_selector)
-    node_names = [n.metadata.name for n in nodes]
-    logger.info(f"Nodes in pool", extra={"nodes": node_names})
+    try:
+        nodes = list_nodes(v1_client, node_selector)
+        node_names = [n.metadata.name for n in nodes]
+        logger.info("Nodes in pool",
+                    extra={"nodes": node_names, "crd_name": name})
+    except Exception as e:
+        tb = traceback.format_exc().replace("\n", " | ")
+        logger.error("Failed to list nodes",
+                     extra={"error": str(e), "trace": tb, "crd_name": name})
+        return
 
-    # 2. Attach IPs
+    # 2. Attach IPs and label nodes
     assigned_nodes = {}
     free_nodes = set(node_names)
     for ip in reserved_ips:
         attached = False
         for node in nodes:
-            if attach_ip.node_has_ip(node, ip, cloud_spec):
+            if gcp_node_has_ip(node, ip, cloud_spec):
                 assigned_nodes[ip] = node.metadata.name
                 free_nodes.discard(node.metadata.name)
                 attached = True
                 break
+
         if not attached:
             if not free_nodes:
-                logger.warning(
-                    f"No free nodes available for IP {ip}",
-                    extra={"ip": ip}
-                )
+                logger.warning("No free nodes available for IP",
+                               extra={"ip": ip, "crd_name": name})
                 continue
             target_node = free_nodes.pop()
-            attach_ip.attach_ip_to_node(cloud_spec, ip, target_node)
-            patch_node_label(target_node, {"ip.ready": "true"})
-            assigned_nodes[ip] = target_node
-            logger.info(
-                f"Labeled node as ip.ready",
-                extra={"node": target_node, "ip": ip}
-            )
+            try:
+                gcp_attach_ip(cloud_spec, ip, target_node)
+                patch_node_label(v1_client, target_node, {"ip.ready": "true"})
+                assigned_nodes[ip] = target_node
+                logger.info("IP attached and node labeled ip.ready",
+                            extra={"node": target_node, "ip": ip, "crd_name": name})
+            except Exception as e:
+                tb = traceback.format_exc().replace("\n", " | ")
+                logger.error("Failed to attach IP or label node",
+                             extra={"ip": ip, "node": target_node, "error": str(e), "trace": tb, "crd_name": name})
 
     # 3. Patch Deployment strategy only
-    patch_deployment_strategy(deployment_ref, strategy)
-    logger.info(
-        "Patched deployment strategy",
-        extra={"deployment": deployment_ref['name'], "strategy": strategy}
-    )
+    try:
+        patch_deployment_strategy(apps_v1_client, deployment_ref, strategy)
+        logger.info("Patched deployment strategy",
+                    extra={"deployment": deployment_ref['name'], "strategy": strategy, "crd_name": name})
+    except Exception as e:
+        tb = traceback.format_exc().replace("\n", " | ")
+        logger.error("Failed to patch deployment strategy",
+                     extra={"deployment": deployment_ref['name'], "error": str(e), "trace": tb, "crd_name": name})
 
 
-def reconcile_all():
+def reconcile_all(v1_client, apps_v1_client, crd_api_client):
+    last_reconcile = {}
+
     while True:
-        crds = crd_api.list_cluster_custom_object(
-            CRD_GROUP, CRD_VERSION, CRD_PLURAL
-        )['items']
+        try:
+            crds = crd_api_client.list_cluster_custom_object(
+                CRD_GROUP, CRD_VERSION, CRD_PLURAL
+            )['items']
+        except Exception as e:
+            tb = traceback.format_exc().replace("\n", " | ")
+            logger.error("Failed to list CRDs",
+                         extra={"error": str(e), "trace": tb})
+            time.sleep(10)
+            continue
+
         now = time.time()
         for crd in crds:
             interval = crd['spec'].get('reconcileInterval', RECONCILE_INTERVAL_DEFAULT)
             last = last_reconcile.get(crd['metadata']['name'], 0)
             if now - last >= interval:
                 try:
-                    reconcile(crd)
+                    reconcile(crd, v1_client, apps_v1_client)
                     last_reconcile[crd['metadata']['name']] = now
                 except Exception as e:
-                    logger.error(
-                        "Error during reconcile",
-                        extra={"crd_name": crd['metadata']['name'], "error": str(e)}
-                    )
+                    tb = traceback.format_exc().replace("\n", " | ")
+                    logger.error("Error during reconcile",
+                                 extra={"crd_name": crd['metadata']['name'], "error": str(e), "trace": tb})
+
         time.sleep(5)

@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ip-address-controller
+  namespace: test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ip-address-controller
+  template:
+    metadata:
+      labels:
+        app: ip-address-controller
+    spec:
+      serviceAccountName: ip-address-controller-sa
+      containers:
+        - name: ip-address-controller
+          image: darkbrains/ip-address-controller:v6
+          imagePullPolicy: Always
+          resources: {}
