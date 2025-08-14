@@ -1,76 +1,296 @@
+import os
+import re
+import time
+import random
 import logging
-from kubernetes import client, config
-from reconciler import reconcile_all
-from health_server import start_health_server, controller_state
+import threading
+import signal
+import sys
+from datetime import datetime, timezone, timedelta
 
-# ---------------- Structured logger ----------------
+from kubernetes import client, config
+from kubernetes.client.rest import ApiException
+
+from health_server import start_health_server, controller_state
+from reconciler import reconcile_all
+
+# ---------------- Logging Setup ----------------
+
+class SafeFormatter(logging.Formatter):
+    def format(self, record):
+        for key in ["crd_name", "node", "ip", "zone", "trace", "leader"]:
+            if not hasattr(record, key):
+                setattr(record, key, "")
+        return super().format(record)
+
 base_logger = logging.getLogger("ip-address-controller")
 base_logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
-formatter = logging.Formatter(
-    'ts=%(asctime)s level=%(levelname)s msg="%(message)s" crd=%(crd_name)s node=%(node)s ip=%(ip)s zone=%(zone)s trace=%(trace)s'
+formatter = SafeFormatter(
+    'ts=%(asctime)s level=%(levelname)s msg="%(message)s" crd=%(crd_name)s '
+    'node=%(node)s ip=%(ip)s zone=%(zone)s trace=%(trace)s leader=%(leader)s'
 )
 handler.setFormatter(formatter)
-base_logger.handlers = [handler]
+base_logger.addHandler(handler)
 
-# Adapter for structured logging
 class ContextLoggerAdapter(logging.LoggerAdapter):
-    def __init__(self, logger):
+    def __init__(self, logger, identity):
         super().__init__(logger, {})
-        self.context = {"crd_name":"", "node":"", "ip":"", "zone":"", "trace":""}
-
+        self.context = {"crd_name": "", "node": "", "ip": "", "zone": "", "trace": "", "leader": identity}
     def set_context(self, **kwargs):
         self.context.update(kwargs)
-
     def process(self, msg, kwargs):
         extra = kwargs.get("extra", {})
         combined = {**self.context, **extra}
-
-        # Ensure all required logging fields exist
-        for key in ["crd_name", "node", "ip", "zone", "trace"]:
-            combined.setdefault(key, "")
-
+        for k in ["crd_name", "node", "ip", "zone", "trace", "leader"]:
+            combined.setdefault(k, "")
         kwargs["extra"] = combined
         return msg, kwargs
 
-logger = ContextLoggerAdapter(base_logger)
+# ---------------- K8s Config ----------------
+# Temporary raw logger for config phase
+_temp_logger = logging.getLogger("ip-address-controller")
+_temp_logger.setLevel(logging.INFO)
+_temp_logger.addHandler(handler)
 
-
-# Start health server early
-start_health_server(port=8080)
-
-# Mark controller as alive
-controller_state["healthy"] = True
-
-# ---------------- Load Kubernetes config ----------------
 try:
     config.load_incluster_config()
-    logger.set_context()
-    logger.info("Using in-cluster config")
+    _temp_logger.info("Using in-cluster config")
 except config.ConfigException:
     config.load_kube_config()
-    logger.set_context()
-    logger.info("Using local kubeconfig")
+    _temp_logger.info("Using local kubeconfig")
 
-# ---------------- Create API clients ----------------
+
 v1 = client.CoreV1Api()
 apps_v1 = client.AppsV1Api()
 crd_api = client.CustomObjectsApi()
+coordination_v1 = client.CoordinationV1Api()
 
+# ---------------- Metadata / Identity ----------------
+
+def get_own_pod_name_from_k8s():
+    try:
+        with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace") as f:
+            namespace = f.read().strip()
+        pod_ip = os.popen("hostname -i").read().strip().split()[0]
+        pods = v1.list_namespaced_pod(namespace)
+        for pod in pods.items:
+            if pod.status.pod_ip == pod_ip:
+                return pod.metadata.name
+    except Exception as e:
+        _temp_logger.warning("Failed to detect pod name via Kubernetes API: {e}")
+    return os.uname()[1]
+
+POD_NAME = get_own_pod_name_from_k8s()
+IDENTITY = POD_NAME
+logger = ContextLoggerAdapter(base_logger, IDENTITY)
+logger.info(f"Pod started with identity {IDENTITY}")
+
+# ---------------- Constants ----------------
+
+LEASE_NAME = os.getenv("LEASE_NAME", "ip-address-controller-leader")
+LEASE_DURATION = int(os.getenv("LEASE_DURATION", "60"))
+SKEW_GRACE = int(os.getenv("LEASE_SKEW_GRACE_SEC", "2"))
+RENEW_EVERY = max(1, LEASE_DURATION // 3)
 
 try:
-    v1.get_api_resources()  # quick ping to API server
-    controller_state["ready"] = True
-    logger.info("Controller is ready to reconcile")
-except Exception as e:
-    logger.error(f"Kubernetes API not ready: {e}")
-    controller_state["ready"] = False
+    with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace") as f:
+        NAMESPACE = f.read().strip()
+except Exception:
+    NAMESPACE = "default"
 
-if __name__ == "__main__":
+controller_state.update({
+    "healthy": True,
+    "ready": False,
+    "last_reconcile_ok": None,
+    "leader": False,
+    "bootstrapped": False,
+    "lease_loop_last_tick": None,
+    "lease_duration_seconds": LEASE_DURATION,
+})
+
+# ---------------- Health Server ----------------
+
+start_health_server(port=8080, logger=logger)
+
+# ---------------- Helper Functions ----------------
+
+RFC3339_RE = re.compile(
+    r"^(?P<prefix>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?P<fraction>\.\d+)?(?P<tz>Z|[+-]\d{2}:\d{2})$"
+)
+
+def _now(): return datetime.now(timezone.utc)
+
+def _parse_rfc3339(val):
+    if not val: return None
+    s = str(val).strip().replace("Z", "+00:00")
+    m = RFC3339_RE.match(s)
+    if not m: return None
+    prefix, fraction, tz = m.group("prefix"), m.group("fraction") or "", m.group("tz")
+    us = (fraction[1:] + "000000")[:6]
+    try:
+        return datetime.fromisoformat(prefix + "." + us + tz)
+    except Exception:
+        return None
+
+def _to_seconds(val, default):
+    try:
+        if val is None: return default
+        return int(str(val).rstrip("sS"))
+    except Exception:
+        return default
+
+def _lease_expired(renewed_at, duration):
+    if not renewed_at:
+        return False
+    now = _now()
+    if renewed_at > now:
+        return False
+    buffer = timedelta(seconds=duration + max(SKEW_GRACE, 5))
+    return now > renewed_at + buffer
+
+def _pod_exists(pod_name):
+    try:
+        v1.read_namespaced_pod(pod_name, NAMESPACE)
+        return True
+    except ApiException as e:
+        return e.status != 404
+
+def _annotate_leader(is_leader: bool):
+    try:
+        body = {"metadata": {"annotations": {"controller-leader": "true" if is_leader else None}}}
+        v1.patch_namespaced_pod(POD_NAME, NAMESPACE, body)
+        logger.info(f"Updated pod annotation: controller-leader={is_leader}")
+    except Exception as e:
+        logger.warning(f"Failed to patch leader annotation: {e}")
+
+# ---------------- Lease Management ----------------
+
+def _create_lease():
+    now = _now()
+    body = client.V1Lease(
+        metadata=client.V1ObjectMeta(name=LEASE_NAME, namespace=NAMESPACE),
+        spec=client.V1LeaseSpec(
+            holder_identity=IDENTITY,
+            lease_duration_seconds=LEASE_DURATION,
+            acquire_time=now,
+            renew_time=now,
+            lease_transitions=0,
+        )
+    )
+    coordination_v1.create_namespaced_lease(NAMESPACE, body)
+    logger.info("Acquired leadership (created lease)")
+    return True
+
+def _renew_lease():
+    lease = coordination_v1.read_namespaced_lease(LEASE_NAME, NAMESPACE)
+    lease.spec.holder_identity = IDENTITY
+    lease.spec.renew_time = _now()
+    coordination_v1.replace_namespaced_lease(LEASE_NAME, NAMESPACE, lease)
+    logger.info("Leader lease renewed")
+
+def _try_takeover(lease):
+    now = _now()
+    lease.spec.holder_identity = IDENTITY
+    lease.spec.acquire_time = now
+    lease.spec.renew_time = now
+    try:
+        coordination_v1.replace_namespaced_lease(LEASE_NAME, NAMESPACE, lease)
+        logger.info("Acquired leadership (takeover)")
+        return True
+    except ApiException as e:
+        if e.status == 409:
+            return False
+        raise
+
+def evaluate_leadership():
+    try:
+        lease = coordination_v1.read_namespaced_lease(LEASE_NAME, NAMESPACE)
+    except ApiException as e:
+        if e.status == 404:
+            controller_state["bootstrapped"] = True
+            return _create_lease()
+        raise
+
+    holder = lease.spec.holder_identity or ""
+    duration = _to_seconds(lease.spec.lease_duration_seconds, LEASE_DURATION)
+    renewed_at = _parse_rfc3339(lease.spec.renew_time)
+    expired = _lease_expired(renewed_at, duration)
+
+    logger.info(f"Lease held by {holder}, renewTime={renewed_at}, expired={expired}")
+    controller_state["bootstrapped"] = True
+
+    if holder == IDENTITY and not expired:
+        return True
+    if holder and holder != IDENTITY and _pod_exists(holder) and not expired:
+        return False
+    return _try_takeover(lease)
+
+# ---------------- Graceful Shutdown ----------------
+
+def shutdown_handler(signum, frame):
+    logger.info("Shutdown initiated")
+    if controller_state.get("leader"):
+        logger.info("Pod was leader, cleaning up")
+        _annotate_leader(False)
+        controller_state["leader"] = False
+        controller_state["ready"] = False
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, shutdown_handler)
+signal.signal(signal.SIGINT, shutdown_handler)
+
+# ---------------- Loops ----------------
+
+def lease_renewal_loop():
     while True:
         try:
-            reconcile_all(v1, apps_v1, crd_api, logger)
-            controller_state["ready"] = True  # ready only if reconciliation succeeds
+            controller_state["lease_loop_last_tick"] = _now()
+            is_leader = evaluate_leadership()
+            controller_state["leader"] = is_leader
+            _annotate_leader(is_leader)
+
+            if is_leader:
+                try:
+                    _renew_lease()
+                except Exception as e:
+                    logger.error(f"Failed to renew lease: {e}")
+                    controller_state["leader"] = False
+                    _annotate_leader(False)
+
+            time.sleep(RENEW_EVERY * random.uniform(0.8, 1.2))
         except Exception as e:
-            logger.error(f"Reconciliation failed: {e}")
+            controller_state["leader"] = False
+            _annotate_leader(False)
+            logger.error(f"Lease renewal error: {e}")
+            time.sleep(RENEW_EVERY)
+
+def controller_loop():
+    while True:
+        try:
+            if controller_state["leader"]:
+                logger.info("This instance is leader, starting reconciliation loop")
+                try:
+                    reconcile_all(v1, apps_v1, crd_api, logger)
+                    controller_state["ready"] = True
+                    controller_state["last_reconcile_ok"] = _now()
+                except Exception as e:
+                    logger.error(f"Reconciliation failed: {e}")
+                    controller_state["ready"] = False
+            else:
+                if controller_state["ready"]:
+                    logger.info("Lost leadership; marking not ready")
+                controller_state["ready"] = False
+                logger.info("Not leader, skipping reconciliation")
+
+            time.sleep(5)
+        except Exception as e:
             controller_state["ready"] = False
+            logger.error(f"Controller main loop error: {e}")
+            time.sleep(5)
+
+# ---------------- Entry Point ----------------
+
+if __name__ == "__main__":
+    threading.Thread(target=lease_renewal_loop, daemon=True).start()
+    controller_loop()

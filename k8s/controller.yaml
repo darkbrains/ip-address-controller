@@ -4,7 +4,7 @@ metadata:
   name: ip-address-controller
   namespace: test
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: ip-address-controller
@@ -16,6 +16,29 @@ spec:
       serviceAccountName: ip-address-controller-sa
       containers:
         - name: ip-address-controller
-          image: darkbrains/ip-address-controller:v25
+          image: darkbrains/ip-address-controller:v1.0.31
           imagePullPolicy: Always
-          resources: {}
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+            successThreshold: 1
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 2

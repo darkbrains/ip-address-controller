@@ -27,8 +27,10 @@ rules:
   # **Read / list / watch pods**
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch"]
-
+    verbs: ["get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
