@@ -8,6 +8,8 @@ from google.oauth2 import service_account
 from google.auth import default
 from google.auth.transport.requests import Request
 from kubernetes import client as k8s_client
+from utils.reconciler import is_node_drained
+
 
 logger = logging.getLogger("ip-address-controller")
 
@@ -172,7 +174,6 @@ def attach_ip_to_node(ip, node_name, creds=None, project=None, crd_name=""):
 
 def detach_ip_from_node(ip, node_name, v1_client, creds=None, project=None, crd_name="", controller_label="app"):
     """Detach the specific static external IP from a drained node."""
-    from reconciler import is_node_drained  # local import to avoid cycles
 
     node = v1_client.read_node(node_name)
 

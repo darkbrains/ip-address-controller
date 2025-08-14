@@ -11,8 +11,8 @@ from datetime import datetime, timezone, timedelta
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
-from health_server import start_health_server, controller_state
-from reconciler import reconcile_all
+from utils.health_server import start_health_server, controller_state
+from utils.reconciler import reconcile_all
 
 # ---------------- Logging Setup ----------------
 
