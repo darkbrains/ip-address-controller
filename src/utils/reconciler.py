@@ -1,6 +1,6 @@
 import time
 import traceback
-from k8s_utils import list_nodes, patch_node_label
+from utils.k8s_utils import list_nodes, patch_node_label
 from cloud.gcp import attach_ip_to_node, detach_ip_from_node, node_has_ip
 
 CRD_GROUP = "netinfra.darkbrains.com"

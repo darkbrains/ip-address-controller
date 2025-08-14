@@ -7,10 +7,8 @@ import threading
 import signal
 import sys
 from datetime import datetime, timezone, timedelta
-
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
-
 from utils.health_server import start_health_server, controller_state
 from utils.reconciler import reconcile_all
 
