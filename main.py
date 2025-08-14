@@ -1,6 +1,7 @@
 import logging
 from kubernetes import client, config
 from reconciler import reconcile_all
+from health_server import start_health_server, controller_state
 
 # ---------------- Structured logger ----------------
 base_logger = logging.getLogger("ip-address-controller")
@@ -34,6 +35,13 @@ class ContextLoggerAdapter(logging.LoggerAdapter):
 
 logger = ContextLoggerAdapter(base_logger)
 
+
+# Start health server early
+start_health_server(port=8080)
+
+# Mark controller as alive
+controller_state["healthy"] = True
+
 # ---------------- Load Kubernetes config ----------------
 try:
     config.load_incluster_config()
@@ -49,5 +57,20 @@ v1 = client.CoreV1Api()
 apps_v1 = client.AppsV1Api()
 crd_api = client.CustomObjectsApi()
 
+
+try:
+    v1.get_api_resources()  # quick ping to API server
+    controller_state["ready"] = True
+    logger.info("Controller is ready to reconcile")
+except Exception as e:
+    logger.error(f"Kubernetes API not ready: {e}")
+    controller_state["ready"] = False
+
 if __name__ == "__main__":
-    reconcile_all(v1, apps_v1, crd_api, logger)
+    while True:
+        try:
+            reconcile_all(v1, apps_v1, crd_api, logger)
+            controller_state["ready"] = True  # ready only if reconciliation succeeds
+        except Exception as e:
+            logger.error(f"Reconciliation failed: {e}")
+            controller_state["ready"] = False
