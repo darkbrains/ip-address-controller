@@ -4,6 +4,13 @@ metadata:
   name: netipallocations.netinfra.darkbrains.com
 spec:
   group: netinfra.darkbrains.com
+  scope: Cluster
+  names:
+    plural: netipallocations
+    singular: netipallocation
+    kind: NetIPAllocation
+    shortNames:
+      - nia
   versions:
     - name: v1alpha1
       served: true
@@ -11,9 +18,14 @@ spec:
       schema:
         openAPIV3Schema:
           type: object
+          required:
+            - spec
           properties:
             spec:
               type: object
+              required:
+                - reservedIPs
+                - cloud
               properties:
                 reservedIPs:
                   type: array
@@ -35,6 +47,10 @@ spec:
                   properties:
                     provider:
                       type: string
+                      enum:
+                        - gcp
+                        - aws
+                        - azure
                     region:
                       type: string
                     zones:
@@ -46,15 +62,10 @@ spec:
                   properties:
                     maxSurge:
                       type: integer
+                      minimum: 0
                     maxUnavailable:
                       type: integer
+                      minimum: 0
                 reconcileInterval:
                   type: integer
-
-  scope: Cluster
-  names:
-    plural: netipallocations
-    singular: netipallocation
-    kind: NetIPAllocation
-    shortNames:
-      - nia
+                  minimum: 5

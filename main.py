@@ -24,6 +24,11 @@ class ContextLoggerAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
         extra = kwargs.get("extra", {})
         combined = {**self.context, **extra}
+
+        # Ensure all required logging fields exist
+        for key in ["crd_name", "node", "ip", "zone", "trace"]:
+            combined.setdefault(key, "")
+
         kwargs["extra"] = combined
         return msg, kwargs
 
