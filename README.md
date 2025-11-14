@@ -63,3 +63,14 @@ kubectl apply -f k8s/
 - `GET /healthz` – Liveness probe
 
 - `GET /readyz` – Readiness probe
+
+## ❤️ Support this project
+
+If you’d like to support **Dark Brains**, you can sponsor us directly on GitHub:
+👉 [**Sponsor via GitHub**](https://github.com/sponsors/darkbrains)
+
+Or donate via crypto:
+
+- 💰 **Bitcoin**: [136Ypsq1db3kAFBZFJ4r887cHB95cqxfFa](https://www.blockchain.com/btc/address/136Ypsq1db3kAFBZFJ4r887cHB95cqxfFa)
+- 💎 **Ethereum**: [0xcfdc4b4c12a743e35c2906317dfe4f58dd8c0888](https://etherscan.io/address/0xcfdc4b4c12a743e35c2906317dfe4f58dd8c0888)
+- 💵 **USDT (ERC20)**: [0xcfdc4b4c12a743e35c2906317dfe4f58dd8c0888](https://etherscan.io/token/0xdac17f958d2ee523a2206206994597c13d831ec7?a=0xcfdc4b4c12a743e35c2906317dfe4f58dd8c0888)
