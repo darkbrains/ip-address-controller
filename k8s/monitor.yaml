@@ -11,3 +11,8 @@ spec:
   selector:
     matchLabels:
       app: ip-address-controller
+  namespaceSelector:
+    matchNames:
+    - kube-system
+  podMetricsEndpoints:
+    - port: metrics
