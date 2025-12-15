@@ -11,6 +11,10 @@ from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 from utils.health_server import start_health_server, controller_state
 from utils.reconciler import reconcile_all
+from utils.metrics import (
+    start_metrics_server, set_controller_info,
+    controller_is_leader, controller_healthy, controller_ready
+)
 
 # ---------------- Logging Setup ----------------
 
@@ -46,7 +50,6 @@ class ContextLoggerAdapter(logging.LoggerAdapter):
         return msg, kwargs
 
 # ---------------- K8s Config ----------------
-# Temporary raw logger for config phase
 _temp_logger = logging.getLogger("ip-address-controller")
 _temp_logger.setLevel(logging.INFO)
 _temp_logger.addHandler(handler)
@@ -90,6 +93,8 @@ LEASE_NAME = os.getenv("LEASE_NAME", "ip-address-controller-leader")
 LEASE_DURATION = int(os.getenv("LEASE_DURATION", "60"))
 SKEW_GRACE = int(os.getenv("LEASE_SKEW_GRACE_SEC", "2"))
 RENEW_EVERY = max(1, LEASE_DURATION // 3)
+CONTROLLER_VERSION = os.getenv("CONTROLLER_VERSION", "1.0.0")
+METRICS_PORT = int(os.getenv("METRICS_PORT", "9999"))
 
 try:
     with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace") as f:
@@ -110,6 +115,11 @@ controller_state.update({
 # ---------------- Health Server ----------------
 
 start_health_server(port=8080, logger=logger)
+
+# ---------------- Metrics Server ----------------
+
+start_metrics_server(port=METRICS_PORT, logger=logger)
+set_controller_info(version=CONTROLLER_VERSION, pod_name=POD_NAME)
 
 # ---------------- Helper Functions ----------------
 
@@ -161,6 +171,12 @@ def _annotate_leader(is_leader: bool):
         logger.info(f"Updated pod annotation: controller-leader={is_leader}")
     except Exception as e:
         logger.warning(f"Failed to patch leader annotation: {e}")
+
+def _update_controller_metrics():
+    """Update controller status metrics."""
+    controller_is_leader.labels(pod_name=POD_NAME).set(1 if controller_state.get("leader") else 0)
+    controller_healthy.labels(pod_name=POD_NAME).set(1 if controller_state.get("healthy") else 0)
+    controller_ready.labels(pod_name=POD_NAME).set(1 if controller_state.get("ready") else 0)
 
 # ---------------- Lease Management ----------------
 
@@ -233,6 +249,7 @@ def shutdown_handler(signum, frame):
         _annotate_leader(False)
         controller_state["leader"] = False
         controller_state["ready"] = False
+        _update_controller_metrics()
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, shutdown_handler)
@@ -247,6 +264,7 @@ def lease_renewal_loop():
             is_leader = evaluate_leadership()
             controller_state["leader"] = is_leader
             _annotate_leader(is_leader)
+            _update_controller_metrics()
 
             if is_leader:
                 try:
@@ -255,17 +273,20 @@ def lease_renewal_loop():
                     logger.error(f"Failed to renew lease: {e}")
                     controller_state["leader"] = False
                     _annotate_leader(False)
+                    _update_controller_metrics()
 
             time.sleep(RENEW_EVERY * random.uniform(0.8, 1.2))
         except Exception as e:
             controller_state["leader"] = False
             _annotate_leader(False)
+            _update_controller_metrics()
             logger.error(f"Lease renewal error: {e}")
             time.sleep(RENEW_EVERY)
 
 def controller_loop():
     while True:
         try:
+            _update_controller_metrics()
             if controller_state["leader"]:
                 logger.info("This instance is leader, starting reconciliation loop")
                 try:
@@ -281,9 +302,11 @@ def controller_loop():
                 controller_state["ready"] = False
                 logger.info("Not leader, skipping reconciliation")
 
+            _update_controller_metrics()
             time.sleep(5)
         except Exception as e:
             controller_state["ready"] = False
+            _update_controller_metrics()
             logger.error(f"Controller main loop error: {e}")
             time.sleep(5)
 
