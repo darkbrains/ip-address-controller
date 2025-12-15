@@ -1,0 +1,13 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  labels:
+    app: ip-address-controller
+    release: prometheus-stack
+  name: ip-address-controller-monitor
+  namespace: kube-system
+spec:
+  jobLabel: app
+  selector:
+    matchLabels:
+      app: ip-address-controller

@@ -1,0 +1,203 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ip-address-controller-alerts
+  namespace: kube-system
+  labels:
+    app: ip-address-controller
+    prometheus: k8s
+    release: prometheus-stack
+spec:
+  groups:
+    # ============== Critical Alerts ==============
+    - name: netipallocation-critical
+      rules:
+        - alert: NetIPAllocationNoLeader
+          expr: sum(netipallocation_controller_is_leader) == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: infrastructure
+          annotations:
+            summary: "No IP Address Controller leader elected"
+            description: "No controller instance has been elected as leader for more than 2 minutes. IP allocation is not functioning."
+
+        - alert: NetIPAllocationCRDUnhealthy
+          expr: netipallocation_crd_status == 0
+          for: 5m
+          labels:
+            severity: critical
+            team: infrastructure
+          annotations:
+            summary: "NetIPAllocation CRD {{ $labels.crd_name }} is unhealthy"
+            description: "CRD {{ $labels.crd_name }} has been unhealthy for more than 5 minutes. IPs may not be properly allocated."
+
+        - alert: NetIPAllocationUnattachedIPsCritical
+          expr: netipallocation_unattached_ips_total > 0
+          for: 10m
+          labels:
+            severity: critical
+            team: infrastructure
+          annotations:
+            summary: "Unattached IPs detected for {{ $labels.crd_name }}"
+            description: "CRD {{ $labels.crd_name }} has {{ $value }} unattached IP(s) for more than 10 minutes. Services may be unreachable."
+
+        - alert: NetIPAllocationControllerDown
+          expr: up{job="ip-address-controller"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: infrastructure
+          annotations:
+            summary: "IP Address Controller is down"
+            description: "The IP Address Controller metrics endpoint is not reachable. Controller may be crashed or not running."
+
+    # ============== Warning Alerts ==============
+    - name: netipallocation-warning
+      rules:
+        - alert: NetIPAllocationUnattachedIPsWarning
+          expr: netipallocation_unattached_ips_total > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: infrastructure
+          annotations:
+            summary: "Unattached IPs detected for {{ $labels.crd_name }}"
+            description: "CRD {{ $labels.crd_name }} has {{ $value }} unattached IP(s). Checking if this resolves automatically."
+
+        - alert: NetIPAllocationHighReconcileErrorRate
+          expr: |
+            (
+              rate(netipallocation_reconcile_total{status="error"}[5m])
+              /
+              rate(netipallocation_reconcile_total[5m])
+            ) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+            team: infrastructure
+          annotations:
+            summary: "High reconciliation error rate for {{ $labels.crd_name }}"
+            description: "CRD {{ $labels.crd_name }} has error rate of {{ $value | humanizePercentage }} in reconciliation."
+
+        - alert: NetIPAllocationGCPAPIErrors
+          expr: rate(netipallocation_gcp_api_errors_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: infrastructure
+          annotations:
+            summary: "GCP API errors detected"
+            description: "GCP API operation '{{ $labels.operation }}' is failing with error type '{{ $labels.error_type }}'."
+
+        - alert: NetIPAllocationSlowReconciliation
+          expr: |
+            histogram_quantile(0.95,
+              rate(netipallocation_reconcile_duration_seconds_bucket[5m])
+            ) > 30
+          for: 10m
+          labels:
+            severity: warning
+            team: infrastructure
+          annotations:
+            summary: "Slow reconciliation for {{ $labels.crd_name }}"
+            description: "95th percentile reconciliation time for {{ $labels.crd_name }} is {{ $value | humanizeDuration }}."
+
+        - alert: NetIPAllocationIPDetachFailures
+          expr: rate(netipallocation_ip_detach_total{status="error"}[10m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: infrastructure
+          annotations:
+            summary: "IP detach failures for {{ $labels.crd_name }}"
+            description: "Failed to detach IPs for CRD {{ $labels.crd_name }}. Cordoned nodes may still have IPs attached."
+
+        - alert: NetIPAllocationIPAttachFailures
+          expr: rate(netipallocation_ip_attach_total{status="error"}[10m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: infrastructure
+          annotations:
+            summary: "IP attach failures for {{ $labels.crd_name }}"
+            description: "Failed to attach IPs for CRD {{ $labels.crd_name }}. Services may not be reachable."
+
+        - alert: NetIPAllocationNodeCordonedWithIP
+          expr: |
+            (netipallocation_node_cordoned == 1)
+            and on(node)
+            (netipallocation_ip_attached == 1)
+          for: 5m
+          labels:
+            severity: warning
+            team: infrastructure
+          annotations:
+            summary: "Cordoned node {{ $labels.node }} still has IP attached"
+            description: "Node {{ $labels.node }} is cordoned but still has IP {{ $labels.ip }} attached. IP should be reallocated."
+
+        - alert: NetIPAllocationControllerNotReady
+          expr: netipallocation_controller_ready == 0
+          for: 5m
+          labels:
+            severity: warning
+            team: infrastructure
+          annotations:
+            summary: "IP Address Controller {{ $labels.pod_name }} is not ready"
+            description: "Controller pod {{ $labels.pod_name }} has been not ready for 5 minutes."
+
+    # ============== Info Alerts ==============
+    - name: netipallocation-info
+      rules:
+        - alert: NetIPAllocationLeaderChanged
+          expr: changes(netipallocation_controller_is_leader[5m]) > 1
+          for: 1m
+          labels:
+            severity: info
+            team: infrastructure
+          annotations:
+            summary: "IP Address Controller leader changed"
+            description: "Controller leadership has changed {{ $value }} times in the last 5 minutes."
+
+        - alert: NetIPAllocationIPReallocated
+          expr: increase(netipallocation_ip_detach_total{status="success"}[5m]) > 0
+          for: 0m
+          labels:
+            severity: info
+            team: infrastructure
+          annotations:
+            summary: "IP detached from node for {{ $labels.crd_name }}"
+            description: "An IP was detached (likely reallocated) for CRD {{ $labels.crd_name }}."
+
+    # ============== SLO Alerts ==============
+    - name: netipallocation-slo
+      rules:
+        - alert: NetIPAllocationAvailabilitySLOBreach
+          expr: |
+            (
+              sum(netipallocation_attached_ips_total)
+              /
+              sum(netipallocation_reserved_ips_total)
+            ) < 0.99
+          for: 5m
+          labels:
+            severity: critical
+            team: infrastructure
+            slo: availability
+          annotations:
+            summary: "IP allocation availability below 99%"
+            description: "Only {{ $value | humanizePercentage }} of reserved IPs are attached. SLO breach."
+
+        - alert: NetIPAllocationReconcileLatencySLOBreach
+          expr: |
+            histogram_quantile(0.99,
+              rate(netipallocation_reconcile_duration_seconds_bucket[10m])
+            ) > 60
+          for: 10m
+          labels:
+            severity: warning
+            team: infrastructure
+            slo: latency
+          annotations:
+            summary: "Reconciliation latency SLO breach"
+            description: "99th percentile reconciliation time is {{ $value | humanizeDuration }}, exceeding 60s SLO."
