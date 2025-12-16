@@ -79,7 +79,7 @@ def get_own_pod_name_from_k8s():
             if pod.status.pod_ip == pod_ip:
                 return pod.metadata.name
     except Exception as e:
-        _temp_logger.warning("Failed to detect pod name via Kubernetes API: {e}")
+        _temp_logger.warning(f"Failed to detect pod name via Kubernetes API: {e}")
     return os.uname()[1]
 
 POD_NAME = get_own_pod_name_from_k8s()
@@ -264,7 +264,8 @@ def lease_renewal_loop():
             is_leader = evaluate_leadership()
             controller_state["leader"] = is_leader
             _annotate_leader(is_leader)
-            _update_controller_metrics()
+            # Update leader metric immediately after election
+            controller_is_leader.labels(pod_name=POD_NAME).set(1 if is_leader else 0)
 
             if is_leader:
                 try:
@@ -273,40 +274,44 @@ def lease_renewal_loop():
                     logger.error(f"Failed to renew lease: {e}")
                     controller_state["leader"] = False
                     _annotate_leader(False)
-                    _update_controller_metrics()
+                    controller_is_leader.labels(pod_name=POD_NAME).set(0)
 
             time.sleep(RENEW_EVERY * random.uniform(0.8, 1.2))
         except Exception as e:
             controller_state["leader"] = False
             _annotate_leader(False)
-            _update_controller_metrics()
+            controller_is_leader.labels(pod_name=POD_NAME).set(0)
             logger.error(f"Lease renewal error: {e}")
             time.sleep(RENEW_EVERY)
+
+
+# Initialize metrics with default values (so all pods report metrics)
+controller_is_leader.labels(pod_name=POD_NAME).set(0)
+controller_healthy.labels(pod_name=POD_NAME).set(1)
+controller_ready.labels(pod_name=POD_NAME).set(0)
 
 def controller_loop():
     while True:
         try:
-            _update_controller_metrics()
             if controller_state["leader"]:
                 logger.info("This instance is leader, starting reconciliation loop")
-                try:
-                    reconcile_all(v1, apps_v1, crd_api, logger)
-                    controller_state["ready"] = True
-                    controller_state["last_reconcile_ok"] = _now()
-                except Exception as e:
-                    logger.error(f"Reconciliation failed: {e}")
-                    controller_state["ready"] = False
+                reconcile_all(v1, apps_v1, crd_api, logger, POD_NAME)
             else:
-                if controller_state["ready"]:
-                    logger.info("Lost leadership; marking not ready")
-                controller_state["ready"] = False
-                logger.info("Not leader, skipping reconciliation")
+                # Non-leader: still healthy and ready (standby)
+                controller_state["ready"] = True  # Ready to take over
+                controller_state["healthy"] = True
+                controller_is_leader.labels(pod_name=POD_NAME).set(0)
+                controller_healthy.labels(pod_name=POD_NAME).set(1)
+                controller_ready.labels(pod_name=POD_NAME).set(1)  # Ready as standby
+                logger.info("Not leader, standing by")
 
-            _update_controller_metrics()
             time.sleep(5)
         except Exception as e:
             controller_state["ready"] = False
-            _update_controller_metrics()
+            controller_state["healthy"] = False
+            controller_is_leader.labels(pod_name=POD_NAME).set(0)
+            controller_healthy.labels(pod_name=POD_NAME).set(0)
+            controller_ready.labels(pod_name=POD_NAME).set(0)
             logger.error(f"Controller main loop error: {e}")
             time.sleep(5)
 

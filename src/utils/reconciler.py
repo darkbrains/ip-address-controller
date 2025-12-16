@@ -6,7 +6,8 @@ from utils.metrics import (
     crd_status, crd_reserved_ips_total, crd_attached_ips_total, crd_unattached_ips_total,
     ip_attached, node_ip_ready, node_cordoned,
     reconcile_total, ip_attach_total, ip_detach_total,
-    reconcile_duration_seconds, gcp_api_errors_total
+    reconcile_duration_seconds, gcp_api_errors_total,
+    controller_ready
 )
 
 CRD_GROUP = "netinfra.darkbrains.com"
@@ -99,7 +100,7 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
         logger.error("Failed to list nodes", extra={"trace": tb, "crd_name": name})
         reconcile_total.labels(crd_name=name, status='error').inc()
         crd_status.labels(crd_name=name).set(0)
-        return
+        return False  # Return failure status
 
     # Update node cordoned metrics
     for node in nodes:
@@ -277,9 +278,9 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
                                         owner.name.startswith(deploy_name) and
                                         pod.metadata.namespace == deploy_ns
                                     ):
-                                        pod_name = pod.metadata.name
-                                        v1_client.delete_namespaced_pod(pod_name, pod.metadata.namespace, grace_period_seconds=0)
-                                        logger.warning(f"Evicted pod {deploy_ns}/{pod_name} from invalid node", extra=safe_extra(node=node_name))
+                                        evict_pod_name = pod.metadata.name
+                                        v1_client.delete_namespaced_pod(evict_pod_name, pod.metadata.namespace, grace_period_seconds=0)
+                                        logger.warning(f"Evicted pod {deploy_ns}/{evict_pod_name} from invalid node", extra=safe_extra(node=node_name))
                 except Exception:
                     tb = traceback.format_exc()
                     logger.error("Error evicting pods from invalid node", extra=safe_extra(node=node_name, trace=tb))
@@ -288,12 +289,24 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
         tb = traceback.format_exc()
         logger.error("Failed to cleanup invalid nodes", extra={"trace": tb, "crd_name": name})
 
+    return reconcile_success
 
-def reconcile_all(v1_client, apps_v1_client, crd_api_client, logger):
+
+def reconcile_all(v1_client, apps_v1_client, crd_api_client, logger, pod_name="unknown"):
+    """
+    Main reconciliation loop. Runs forever, processing all CRDs.
+    Args:
+        v1_client: Kubernetes CoreV1Api client
+        apps_v1_client: Kubernetes AppsV1Api client
+        crd_api_client: Kubernetes CustomObjectsApi client
+        logger: Logger instance
+        pod_name: Pod name for metrics labeling
+    """
     last_reconcile_time = {}
 
     while True:
         now = time.time()
+        cycle_success = True
         try:
             crds = crd_api_client.list_cluster_custom_object(
                 group=CRD_GROUP,
@@ -316,11 +329,22 @@ def reconcile_all(v1_client, apps_v1_client, crd_api_client, logger):
                     continue
 
                 last_reconcile_time[crd_name] = now
-                reconcile(crd, v1_client, apps_v1_client, logger)
+                try:
+                    success = reconcile(crd, v1_client, apps_v1_client, logger)
+                    if success is False:
+                        cycle_success = False
+                except Exception:
+                    tb = traceback.format_exc()
+                    logger.error(f"Failed to reconcile CRD {crd_name}", extra={"trace": tb, "crd_name": crd_name})
+                    cycle_success = False
+
+            # Update controller ready metric after each cycle
+            controller_ready.labels(pod_name=pod_name).set(1 if cycle_success else 0)
 
         except Exception:
             tb = traceback.format_exc()
             logger.set_context(trace=tb)
             logger.error("Failed to list CRDs or reconcile")
+            controller_ready.labels(pod_name=pod_name).set(0)
 
         time.sleep(5)
