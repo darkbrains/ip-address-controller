@@ -1,7 +1,7 @@
 import time
 import traceback
 from utils.k8s_utils import list_nodes, patch_node_label
-from cloud.gcp import attach_ip_to_node, detach_ip_from_node, node_has_ip, has_deployment_pods_on_node
+from cloud.gcp import attach_ip_to_node, detach_ip_from_node, node_has_ip
 from utils.metrics import (
     crd_status, crd_reserved_ips_total, crd_attached_ips_total, crd_unattached_ips_total,
     ip_attached, node_ip_ready, node_cordoned,
@@ -26,6 +26,86 @@ def safe_extra(**kwargs):
     return kwargs
 
 
+def _is_owned_by_workload(owner, workload_kind, workload_name):
+    """Check if owner reference matches the workload."""
+    if workload_kind == "Deployment":
+        return owner.kind == "ReplicaSet" and workload_name in owner.name
+    elif workload_kind == "StatefulSet":
+        return owner.kind == "StatefulSet" and owner.name == workload_name
+    elif workload_kind == "DaemonSet":
+        return owner.kind == "DaemonSet" and owner.name == workload_name
+    return False
+
+
+def has_workload_pods_on_node(node_name, workload_ref, v1_client, logger):
+    """Check if the referenced workload has pods running on this node."""
+    if not workload_ref:
+        return False
+
+    workload_kind = workload_ref.get("kind")
+    workload_name = workload_ref.get("name")
+    workload_namespace = workload_ref.get("namespace", "default")
+
+    if not workload_kind or not workload_name:
+        return False
+
+    try:
+        pods = v1_client.list_namespaced_pod(
+            namespace=workload_namespace,
+            field_selector=f"spec.nodeName={node_name}",
+        )
+
+        for pod in pods.items:
+            if pod.status.phase not in ("Running", "Pending"):
+                continue
+            if pod.metadata.deletion_timestamp:
+                continue
+
+            owner_refs = pod.metadata.owner_references or []
+            pod_labels = pod.metadata.labels or {}
+
+            # Check owner references based on workload kind
+            for owner in owner_refs:
+                if _is_owned_by_workload(owner, workload_kind, workload_name):
+                    logger.info(
+                        f"Found running pod {pod.metadata.name} from {workload_kind} {workload_name} on node {node_name}",
+                        extra=safe_extra(
+                            node=node_name,
+                            workload_kind=workload_kind,
+                            workload_name=workload_name,
+                        ),
+                    )
+                    return True
+
+            # Fallback: check labels
+            if pod_labels.get("app") == workload_name or pod_labels.get("app.kubernetes.io/name") == workload_name:
+                logger.info(
+                    f"Found running pod {pod.metadata.name} (label match) from {workload_kind} {workload_name} on node {node_name}",
+                    extra=safe_extra(
+                        node=node_name,
+                        workload_kind=workload_kind,
+                        workload_name=workload_name,
+                    ),
+                )
+                return True
+
+        return False
+
+    except Exception:
+        tb = traceback.format_exc()
+        logger.error(
+            "Error checking workload pods on node",
+            extra=safe_extra(
+                node=node_name,
+                workload_kind=workload_kind,
+                workload_name=workload_name,
+                namespace=workload_namespace,
+                trace=tb,
+            ),
+        )
+        return True
+
+
 def node_has_any_reserved_ip(node, reserved_ips, creds=None, crd_name=None):
     for ip in reserved_ips:
         if node_has_ip(node, ip, creds=creds, crd_name=crd_name):
@@ -37,13 +117,14 @@ def is_node_schedulable(node):
     return not getattr(node.spec, "unschedulable", False)
 
 
-def is_node_drained(node, v1_client, controller_label="app", logger=None, deployment_ref=None):
+def is_node_drained(node, v1_client, controller_label="app", logger=None, workload_ref=None):
     """Check if node is drained (no relevant workload pods running)."""
     if is_node_schedulable(node):
         return False
 
     node_name = node.metadata.name
     pods = v1_client.list_pod_for_all_namespaces(field_selector=f"spec.nodeName={node_name}").items
+
     for pod in pods:
         if pod.metadata.namespace in ("kube-system", "gke-system", "istio-system"):
             continue
@@ -53,16 +134,20 @@ def is_node_drained(node, v1_client, controller_label="app", logger=None, deploy
         if is_daemonset:
             continue
 
-        if deployment_ref:
-            dep_name = deployment_ref.get("name", "")
-            dep_namespace = deployment_ref.get("namespace", "default")
+        if workload_ref:
+            workload_kind = workload_ref.get("kind")
+            workload_name = workload_ref.get("name", "")
+            workload_namespace = workload_ref.get("namespace", "default")
 
             for ref in owner_refs:
-                if ref.kind == "ReplicaSet" and dep_name in ref.name:
-                    if pod.metadata.namespace == dep_namespace:
+                if _is_owned_by_workload(ref, workload_kind, workload_name):
+                    if pod.metadata.namespace == workload_namespace:
                         if pod.status.phase in ("Running", "Pending") and not pod.metadata.deletion_timestamp:
                             if logger:
-                                logger.info(f"Found deployment pod {pod.metadata.name} on node", extra=safe_extra(node=node_name))
+                                logger.info(
+                                    f"Found {workload_kind} pod {pod.metadata.name} on node",
+                                    extra=safe_extra(node=node_name)
+                                )
                             return False
         else:
             labels = pod.metadata.labels or {}
@@ -74,13 +159,32 @@ def is_node_drained(node, v1_client, controller_label="app", logger=None, deploy
     return True
 
 
+def get_workload_ref(spec):
+    """Get workload reference from spec, supporting both old and new format."""
+    # New format: workloadRef
+    if "workloadRef" in spec:
+        return spec.get("workloadRef", {})
+
+    # Old format: deploymentRef (backwards compatibility)
+    if "deploymentRef" in spec:
+        dep_ref = spec.get("deploymentRef", {})
+        if dep_ref:
+            return {
+                "kind": "Deployment",
+                "name": dep_ref.get("name"),
+                "namespace": dep_ref.get("namespace", "default"),
+            }
+
+    return {}
+
+
 def reconcile(crd, v1_client, apps_v1_client, logger):
     name = crd.get('metadata', {}).get('name', '')
     spec = crd.get('spec', {})
     reserved_ips = spec.get('reservedIPs', [])
     node_selector = spec.get('nodeSelector', {})
     cloud_spec = spec.get('cloud', {})
-    deployment_ref = spec.get("deploymentRef", {})
+    workload_ref = get_workload_ref(spec)
 
     logger.set_context(crd_name=name)
     logger.info("Reconciling CRD")
@@ -100,7 +204,7 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
         logger.error("Failed to list nodes", extra={"trace": tb, "crd_name": name})
         reconcile_total.labels(crd_name=name, status='error').inc()
         crd_status.labels(crd_name=name).set(0)
-        return False  # Return failure status
+        return False
 
     # Update node cordoned metrics
     for node in nodes:
@@ -119,30 +223,39 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
         for node in nodes:
             node_name = node.metadata.name
             logger.set_context(node=node_name)
-            # Check if node is cordoned (use different variable name to avoid shadowing import)
             is_node_cordoned = not is_node_schedulable(node)
+
             try:
                 has_ip = node_has_ip(node, ip, creds=cloud_spec.get("credentials"), crd_name=name)
                 has_label = node.metadata.labels.get("ip.ready") == "true"
 
                 if has_ip:
-                    logger.info(f"DEBUG: Found IP on node, cordoned={is_node_cordoned}", extra=safe_extra(node=node_name, ip=ip))
+                    logger.info(
+                        f"DEBUG: Found IP on node, cordoned={is_node_cordoned}",
+                        extra=safe_extra(node=node_name, ip=ip)
+                    )
                     # Update metrics
                     ip_attached.labels(crd_name=name, ip=ip, node=node_name).set(1)
                     node_ip_ready.labels(node=node_name, crd_name=name).set(1 if has_label else 0)
 
-                    node_drained = is_node_drained(node, v1_client, logger=logger, deployment_ref=deployment_ref)
+                    node_drained = is_node_drained(node, v1_client, logger=logger, workload_ref=workload_ref)
 
                     should_detach = False
                     if node_drained:
                         should_detach = True
                         logger.info("Node is drained, will detach IP", extra=safe_extra(node=node_name, ip=ip))
                     elif is_node_cordoned:
-                        if not has_deployment_pods_on_node(node_name, deployment_ref, v1_client, logger):
+                        if not has_workload_pods_on_node(node_name, workload_ref, v1_client, logger):
                             should_detach = True
-                            logger.info("Node is cordoned with no deployment pods, will detach IP", extra=safe_extra(node=node_name, ip=ip))
+                            logger.info(
+                                "Node is cordoned with no workload pods, will detach IP",
+                                extra=safe_extra(node=node_name, ip=ip)
+                            )
                         else:
-                            logger.info("Node is cordoned but deployment pods still running, keeping IP", extra=safe_extra(node=node_name, ip=ip))
+                            logger.info(
+                                "Node is cordoned but workload pods still running, keeping IP",
+                                extra=safe_extra(node=node_name, ip=ip)
+                            )
 
                     if should_detach:
                         try:
@@ -150,10 +263,13 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
                                 ip, node_name, v1_client,
                                 creds=cloud_spec.get("credentials"),
                                 crd_name=name,
-                                deployment_ref=deployment_ref,
+                                workload_ref=workload_ref,
                             )
                             patch_node_label(v1_client, node_name, {"ip.ready": None}, crd_name=name)
-                            logger.info("Detached IP and removed label from node", extra=safe_extra(node=node_name, ip=ip))
+                            logger.info(
+                                "Detached IP and removed label from node",
+                                extra=safe_extra(node=node_name, ip=ip)
+                            )
                             # Update metrics
                             ip_detach_total.labels(crd_name=name, status='success').inc()
                             ip_attached.labels(crd_name=name, ip=ip, node=node_name).set(0)
@@ -177,11 +293,17 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
 
                 elif has_label:
                     if not node_has_any_reserved_ip(node, reserved_ips, creds=cloud_spec.get("credentials"), crd_name=name):
-                        logger.warning("Node has ip.ready label but has none of the reserved IPs, removing label", extra=safe_extra(node=node_name, ip=ip))
+                        logger.warning(
+                            "Node has ip.ready label but has none of the reserved IPs, removing label",
+                            extra=safe_extra(node=node_name, ip=ip)
+                        )
                         patch_node_label(v1_client, node_name, {"ip.ready": None}, crd_name=name)
                         node_ip_ready.labels(node=node_name, crd_name=name).set(0)
                     else:
-                        logger.debug("Node has different reserved IP, skipping label removal", extra=safe_extra(node=node_name, ip=ip))
+                        logger.debug(
+                            "Node has different reserved IP, skipping label removal",
+                            extra=safe_extra(node=node_name, ip=ip)
+                        )
 
             except Exception:
                 tb = traceback.format_exc()
@@ -208,14 +330,20 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
                 patch_node_label(v1_client, target_node.metadata.name, {"ip.ready": "true"}, crd_name=name)
                 assigned_nodes[ip] = target_node.metadata.name
                 attached_count += 1
-                logger.info("IP attached and node labeled ip.ready", extra=safe_extra(node=target_node.metadata.name, ip=ip))
+                logger.info(
+                    "IP attached and node labeled ip.ready",
+                    extra=safe_extra(node=target_node.metadata.name, ip=ip)
+                )
                 # Update metrics
                 ip_attach_total.labels(crd_name=name, status='success').inc()
                 ip_attached.labels(crd_name=name, ip=ip, node=target_node.metadata.name).set(1)
                 node_ip_ready.labels(node=target_node.metadata.name, crd_name=name).set(1)
             except Exception:
                 tb = traceback.format_exc()
-                logger.error("GCP API error attaching IP to node", extra=safe_extra(node=target_node.metadata.name, ip=ip, trace=tb))
+                logger.error(
+                    "GCP API error attaching IP to node",
+                    extra=safe_extra(node=target_node.metadata.name, ip=ip, trace=tb)
+                )
                 ip_attach_total.labels(crd_name=name, status='error').inc()
                 gcp_api_errors_total.labels(operation='attach', error_type='api_error').inc()
                 unattached_count += 1
@@ -256,7 +384,10 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
                 logger.warning("Could not validate node IPs", extra=safe_extra(node=node_name))
 
             if not has_valid_ip:
-                logger.warning("Node is labeled ip.ready but has no valid reserved IP", extra=safe_extra(node=node_name))
+                logger.warning(
+                    "Node is labeled ip.ready but has no valid reserved IP",
+                    extra=safe_extra(node=node_name)
+                )
                 try:
                     patch_node_label(v1_client, node_name, {"ip.ready": None}, crd_name=name)
                     logger.info("Removed ip.ready label from node", extra=safe_extra(node=node_name))
@@ -265,25 +396,37 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
                     logger.error("Failed to remove ip.ready label", extra=safe_extra(node=node_name))
 
                 try:
-                    if deployment_ref:
-                        deploy_name = deployment_ref.get("name")
-                        deploy_ns = deployment_ref.get("namespace", "default")
-                        if deploy_name and deploy_ns:
-                            pods = v1_client.list_pod_for_all_namespaces(field_selector=f"spec.nodeName={node_name}").items
+                    if workload_ref:
+                        workload_kind = workload_ref.get("kind")
+                        workload_name = workload_ref.get("name")
+                        workload_namespace = workload_ref.get("namespace", "default")
+
+                        if workload_name and workload_namespace:
+                            pods = v1_client.list_pod_for_all_namespaces(
+                                field_selector=f"spec.nodeName={node_name}"
+                            ).items
+
                             for pod in pods:
                                 owners = pod.metadata.owner_references or []
                                 for owner in owners:
-                                    if (
-                                        owner.kind == "ReplicaSet" and
-                                        owner.name.startswith(deploy_name) and
-                                        pod.metadata.namespace == deploy_ns
-                                    ):
-                                        evict_pod_name = pod.metadata.name
-                                        v1_client.delete_namespaced_pod(evict_pod_name, pod.metadata.namespace, grace_period_seconds=0)
-                                        logger.warning(f"Evicted pod {deploy_ns}/{evict_pod_name} from invalid node", extra=safe_extra(node=node_name))
+                                    if _is_owned_by_workload(owner, workload_kind, workload_name):
+                                        if pod.metadata.namespace == workload_namespace:
+                                            evict_pod_name = pod.metadata.name
+                                            v1_client.delete_namespaced_pod(
+                                                evict_pod_name,
+                                                pod.metadata.namespace,
+                                                grace_period_seconds=0
+                                            )
+                                            logger.warning(
+                                                f"Evicted pod {workload_namespace}/{evict_pod_name} from invalid node",
+                                                extra=safe_extra(node=node_name)
+                                            )
                 except Exception:
                     tb = traceback.format_exc()
-                    logger.error("Error evicting pods from invalid node", extra=safe_extra(node=node_name, trace=tb))
+                    logger.error(
+                        "Error evicting pods from invalid node",
+                        extra=safe_extra(node=node_name, trace=tb)
+                    )
 
     except Exception:
         tb = traceback.format_exc()
@@ -295,12 +438,6 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
 def reconcile_all(v1_client, apps_v1_client, crd_api_client, logger, pod_name="unknown"):
     """
     Main reconciliation loop. Runs forever, processing all CRDs.
-    Args:
-        v1_client: Kubernetes CoreV1Api client
-        apps_v1_client: Kubernetes AppsV1Api client
-        crd_api_client: Kubernetes CustomObjectsApi client
-        logger: Logger instance
-        pod_name: Pod name for metrics labeling
     """
     last_reconcile_time = {}
 
@@ -335,10 +472,12 @@ def reconcile_all(v1_client, apps_v1_client, crd_api_client, logger, pod_name="u
                         cycle_success = False
                 except Exception:
                     tb = traceback.format_exc()
-                    logger.error(f"Failed to reconcile CRD {crd_name}", extra={"trace": tb, "crd_name": crd_name})
+                    logger.error(
+                        f"Failed to reconcile CRD {crd_name}",
+                        extra={"trace": tb, "crd_name": crd_name}
+                    )
                     cycle_success = False
 
-            # Update controller ready metric after each cycle
             controller_ready.labels(pod_name=pod_name).set(1 if cycle_success else 0)
 
         except Exception:

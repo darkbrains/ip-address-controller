@@ -13,7 +13,6 @@ logger = logging.getLogger("ip-address-controller")
 
 def build_compute_service(creds):
     """Create the Compute Engine API client."""
-    # Modern google-api-python-client works fine with just credentials=
     return build("compute", "v1", credentials=creds)
 
 
@@ -30,7 +29,6 @@ def get_gcp_credentials():
             project = creds.project_id
         else:
             creds, project = default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-            # Refresh if needed (e.g., Workload Identity)
             if getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
                 creds.refresh(Request())
 
@@ -77,7 +75,6 @@ def node_has_ip(node, ip, creds=None, project=None, crd_name=""):
         return False
 
 
-# Optional helper: use this from your reconciler if you want at most ONE reserved IP per node.
 def node_has_any_reserved_ip(node, reserved_ips, creds=None, project=None, crd_name=""):
     """Return True if the node already has any IP from the reserved pool."""
     try:
@@ -102,7 +99,12 @@ def node_has_any_reserved_ip(node, reserved_ips, creds=None, project=None, crd_n
         tb = traceback.format_exc()
         logger.error(
             "Error checking any reserved IP on node",
-            extra={"crd_name": crd_name, "node": node.metadata.name, "zone": node.metadata.labels.get("topology.kubernetes.io/zone", ""), "trace": tb},
+            extra={
+                "crd_name": crd_name,
+                "node": node.metadata.name,
+                "zone": node.metadata.labels.get("topology.kubernetes.io/zone", ""),
+                "trace": tb,
+            },
         )
         return False
 
@@ -118,7 +120,6 @@ def attach_ip_to_node(ip, node_name, creds=None, project=None, crd_name=""):
         zone = node.metadata.labels.get("topology.kubernetes.io/zone", "")
         service = build_compute_service(creds)
 
-        # Get the instance and NIC
         instance = service.instances().get(
             project=project, zone=zone, instance=node_name
         ).execute()
@@ -126,7 +127,6 @@ def attach_ip_to_node(ip, node_name, creds=None, project=None, crd_name=""):
         iface_name = iface["name"]
         access_configs = iface.get("accessConfigs", [])
 
-        # If there's an existing ONE_TO_ONE_NAT, delete it first (natIP is immutable)
         for ac in access_configs:
             if ac.get("type") == "ONE_TO_ONE_NAT":
                 service.instances().deleteAccessConfig(
@@ -136,9 +136,8 @@ def attach_ip_to_node(ip, node_name, creds=None, project=None, crd_name=""):
                     networkInterface=iface_name,
                     accessConfig=ac["name"],
                 ).execute()
-                break  # only one external IP per NIC in GKE
+                break
 
-        # Add the static external IP
         body = {"name": "external-nat", "type": "ONE_TO_ONE_NAT", "natIP": ip}
         service.instances().addAccessConfig(
             project=project,
@@ -174,58 +173,91 @@ def is_node_cordoned(node):
     return getattr(node.spec, 'unschedulable', False) or False
 
 
-def has_deployment_pods_on_node(node_name, deployment_ref, v1_client, logger):
-    """Check if the referenced deployment has pods running on this node."""
-    if not deployment_ref:
+def _is_owned_by_workload(owner, workload_kind, workload_name):
+    """Check if owner reference matches the workload."""
+    if workload_kind == "Deployment":
+        return owner.kind == "ReplicaSet" and workload_name in owner.name
+    elif workload_kind == "StatefulSet":
+        return owner.kind == "StatefulSet" and owner.name == workload_name
+    elif workload_kind == "DaemonSet":
+        return owner.kind == "DaemonSet" and owner.name == workload_name
+    return False
+
+
+def has_workload_pods_on_node(node_name, workload_ref, v1_client, logger):
+    """Check if the referenced workload has pods running on this node."""
+    if not workload_ref:
         return False
 
-    dep_name = deployment_ref.get("name")
-    dep_namespace = deployment_ref.get("namespace", "default")
-    if not dep_name:
+    workload_kind = workload_ref.get("kind")
+    workload_name = workload_ref.get("name")
+    workload_namespace = workload_ref.get("namespace", "default")
+
+    if not workload_kind or not workload_name:
         return False
     try:
         pods = v1_client.list_namespaced_pod(
-            namespace=dep_namespace,
+            namespace=workload_namespace,
             field_selector=f"spec.nodeName={node_name}",
         )
 
         for pod in pods.items:
+            if pod.status.phase not in ("Running", "Pending"):
+                continue
+            if pod.metadata.deletion_timestamp:
+                continue
             owner_refs = pod.metadata.owner_references or []
             pod_labels = pod.metadata.labels or {}
             for owner in owner_refs:
-                if owner.kind == "ReplicaSet" and dep_name in owner.name:
-                    if pod.status.phase in ("Running", "Pending") and not pod.metadata.deletion_timestamp:
-                        logger.info(
-                            f"Found running pod {pod.metadata.name} from deployment {dep_name} on node {node_name}",
-                            extra={"node": node_name, "pod": pod.metadata.name, "deployment": dep_name},
-                        )
-                        return True
-            if pod_labels.get("app") == dep_name or pod_labels.get("app.kubernetes.io/name") == dep_name:
-                if pod.status.phase in ("Running", "Pending") and not pod.metadata.deletion_timestamp:
+                if _is_owned_by_workload(owner, workload_kind, workload_name):
                     logger.info(
-                        f"Found running pod {pod.metadata.name} (label match) from deployment {dep_name} on node {node_name}",
-                        extra={"node": node_name, "pod": pod.metadata.name, "deployment": dep_name},
+                        f"Found running pod {pod.metadata.name} from {workload_kind} {workload_name} on node {node_name}",
+                        extra={
+                            "node": node_name,
+                            "pod": pod.metadata.name,
+                            "workload_kind": workload_kind,
+                            "workload_name": workload_name,
+                        },
                     )
                     return True
+
+            # Fallback: check labels
+            if pod_labels.get("app") == workload_name or pod_labels.get("app.kubernetes.io/name") == workload_name:
+                logger.info(
+                    f"Found running pod {pod.metadata.name} (label match) from {workload_kind} {workload_name} on node {node_name}",
+                    extra={
+                        "node": node_name,
+                        "pod": pod.metadata.name,
+                        "workload_kind": workload_kind,
+                        "workload_name": workload_name,
+                    },
+                )
+                return True
 
         return False
     except Exception:
         tb = traceback.format_exc()
         logger.error(
-            f"Error checking deployment pods on node",
-            extra={"node": node_name, "deployment": dep_name, "namespace": dep_namespace, "trace": tb},
+            "Error checking workload pods on node",
+            extra={
+                "node": node_name,
+                "workload_kind": workload_kind,
+                "workload_name": workload_name,
+                "namespace": workload_namespace,
+                "trace": tb,
+            },
         )
         return True
 
 
-def detach_ip_from_node(ip, node_name, v1_client, creds=None, project=None, crd_name="", controller_label="app", deployment_ref=None, node_selector=None):
+def detach_ip_from_node(ip, node_name, v1_client, creds=None, project=None, crd_name="", controller_label="app", workload_ref=None, node_selector=None):
     """Detach the specific static external IP from a drained or cordoned node and re-attach to healthy node."""
     from utils.reconciler import is_node_drained
     node = v1_client.read_node(node_name)
     zone = node.metadata.labels.get("topology.kubernetes.io/zone", "")
 
     node_cordoned = is_node_cordoned(node)
-    node_drained = is_node_drained(node, v1_client, controller_label=controller_label, logger=logger)
+    node_drained = is_node_drained(node, v1_client, controller_label=controller_label, logger=logger, workload_ref=workload_ref)
 
     if not node_cordoned and not node_drained:
         logger.info(
@@ -235,15 +267,16 @@ def detach_ip_from_node(ip, node_name, v1_client, creds=None, project=None, crd_
         return
 
     if node_cordoned and not node_drained:
-        if has_deployment_pods_on_node(node_name, deployment_ref, v1_client, logger):
+        if has_workload_pods_on_node(node_name, workload_ref, v1_client, logger):
             logger.info(
-                f"Node {node_name} is cordoned but deployment pods still running; skipping IP detach",
+                f"Node {node_name} is cordoned but workload pods still running; skipping IP detach",
                 extra={
                     "crd_name": crd_name,
                     "node": node_name,
                     "ip": ip,
                     "zone": zone,
-                    "deployment": deployment_ref.get("name") if deployment_ref else None,
+                    "workload_kind": workload_ref.get("kind") if workload_ref else None,
+                    "workload_name": workload_ref.get("name") if workload_ref else None,
                 },
             )
             return
@@ -313,6 +346,7 @@ def detach_ip_from_node(ip, node_name, v1_client, creds=None, project=None, crd_
             extra={"crd_name": crd_name, "node": node_name, "ip": ip, "zone": zone, "trace": tb},
         )
         raise
+
 
 def find_healthy_node(v1_client, node_selector=None, exclude_node=None):
     """Find a healthy node matching the selector."""

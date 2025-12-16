@@ -9,28 +9,21 @@ kind: ClusterRole
 metadata:
   name: ip-address-controller-role
 rules:
-  # Watch / list / get CRDs
-  - apiGroups: ["netinfra.darkbrains.com"]
-    resources: ["netipallocations"]
-    verbs: ["get", "list", "watch", "update", "patch"]
-
-  # Read / list / patch nodes
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch"]
-
-  # Read / patch Deployments
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["get", "list", "watch", "patch"]
-
-  # **Read / list / watch pods**
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "update", "patch", "delete"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["netinfra.darkbrains.com"]
+    resources: ["netipallocations"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
