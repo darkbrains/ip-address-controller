@@ -212,7 +212,11 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
         node_cordoned.labels(node=node.metadata.name).set(1 if is_cordoned else 0)
 
     assigned_nodes = {}
-    free_nodes = set(n.metadata.name for n in nodes)
+    # Track nodes that already have a reserved IP (one IP per node rule)
+    nodes_with_reserved_ip = set()
+    for node in nodes:
+        if node_has_any_reserved_ip(node, reserved_ips, creds=cloud_spec.get("credentials"), crd_name=name):
+            nodes_with_reserved_ip.add(node.metadata.name)
 
     for ip in reserved_ips:
         logger.set_context(ip=ip, crd_name=name)
@@ -270,6 +274,8 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
                                 "Detached IP and removed label from node",
                                 extra=safe_extra(node=node_name, ip=ip)
                             )
+                            # Update tracking
+                            nodes_with_reserved_ip.discard(node_name)
                             # Update metrics
                             ip_detach_total.labels(crd_name=name, status='success').inc()
                             ip_attached.labels(crd_name=name, ip=ip, node=node_name).set(0)
@@ -312,15 +318,23 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
                 reconcile_success = False
 
         if not attached:
-            free_nodes_schedulable = [n for n in nodes if is_node_schedulable(n) and n.metadata.name in free_nodes]
+            # Only consider nodes that don't already have a reserved IP
+            free_nodes_schedulable = [
+                n for n in nodes
+                if is_node_schedulable(n)
+                and n.metadata.name not in nodes_with_reserved_ip
+            ]
+
             if not free_nodes_schedulable:
-                logger.warning("No schedulable free nodes available for IP", extra=safe_extra(ip=ip))
+                logger.info(
+                    "No free nodes available for IP (all nodes already have a reserved IP or are unschedulable)",
+                    extra=safe_extra(ip=ip)
+                )
                 unattached_count += 1
                 ip_attached.labels(crd_name=name, ip=ip, node='none').set(0)
                 continue
 
-            target_node = free_nodes_schedulable.pop(0)
-            free_nodes.remove(target_node.metadata.name)
+            target_node = free_nodes_schedulable[0]
             try:
                 attach_ip_to_node(
                     ip, target_node.metadata.name,
@@ -329,6 +343,7 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
                 )
                 patch_node_label(v1_client, target_node.metadata.name, {"ip.ready": "true"}, crd_name=name)
                 assigned_nodes[ip] = target_node.metadata.name
+                nodes_with_reserved_ip.add(target_node.metadata.name)  # Track this node now has an IP
                 attached_count += 1
                 logger.info(
                     "IP attached and node labeled ip.ready",
