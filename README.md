@@ -123,7 +123,7 @@ kubectl logs -l app=ip-address-controller -f
 |----------|-------------|
 | `GET /healthz` | Liveness probe - controller is running |
 | `GET /readyz` | Readiness probe - controller is ready to reconcile |
-| `GET /metrics` | Prometheus metrics endpoint (port 9090) |
+| `GET /metrics` | Prometheus metrics endpoint (port 9999) |
 
 ### Prometheus Metrics
 
@@ -341,7 +341,7 @@ gcloud iam service-accounts add-iam-policy-binding ip-controller-sa@PROJECT_ID.i
 |----------|---------|-------------|
 | `LEASE_NAME` | `ip-address-controller-leader` | Kubernetes Lease name |
 | `LEASE_DURATION` | `60` | Lease duration in seconds |
-| `METRICS_PORT` | `9090` | Prometheus metrics port |
+| `METRICS_PORT` | `9999` | Prometheus metrics port |
 | `CONTROLLER_VERSION` | `1.0.0` | Controller version for metrics |
 | `CLUSTER_NAME` | `` | Optional cluster name for metrics labeling |
 
@@ -455,8 +455,8 @@ kubectl rollout restart deployment/ip-address-controller
 **Metrics not showing in Prometheus:**
 ```bash
 # Verify metrics endpoint
-kubectl port-forward -n kube-system pod/$(kubectl get pod -n kube-system -l app=ip-address-controller -o jsonpath='{.items[0].metadata.name}') 9090:9090
-curl http://localhost:9090/metrics
+kubectl port-forward -n kube-system pod/$(kubectl get pod -n kube-system -l app=ip-address-controller -o jsonpath='{.items[0].metadata.name}') 9999:9999
+curl http://localhost:9999/metrics
 
 # Check PodMonitor is discovered
 kubectl get podmonitor -n monitoring
