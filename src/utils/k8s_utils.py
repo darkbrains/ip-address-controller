@@ -29,26 +29,3 @@ def patch_node_label(v1_client, node_name, labels, logger=None, crd_name=""):
             logger.set_context(crd=crd_name, node=node_name, trace=tb)
             logger.error("Failed to patch node labels")
         raise
-
-def patch_deployment_strategy(apps_v1_client, deployment_ref, strategy, logger=None, crd_name=""):
-    try:
-        dep_name = deployment_ref.get("name")
-        dep_ns = deployment_ref.get("namespace", "default")
-        dep = apps_v1_client.read_namespaced_deployment(dep_name, dep_ns)
-
-        patched = False
-        if dep.spec.strategy.type != strategy.get("type"):
-            dep.spec.strategy.type = strategy.get("type")
-            apps_v1_client.patch_namespaced_deployment(dep_name, dep_ns, dep)
-            patched = True
-
-        if logger:
-            logger.set_context(crd=crd_name, node="", ip="", zone="")
-            logger.info("Patched deployment strategy" if patched else "Deployment strategy already matches CRD")
-    except Exception:
-        tb = traceback.format_exc()
-        if logger:
-            logger.set_context(crd=crd_name, trace=tb)
-            logger.error("Failed to patch deployment strategy")
-        raise
-

@@ -16,7 +16,8 @@ A Kubernetes controller that manages static external IPs for cloud VM nodes base
 | ☁️ **Multi-Cloud** | Supports GCP, AWS, and Azure |
 | 📊 **Prometheus Metrics** | Built-in metrics for monitoring and alerting |
 | 📈 **Grafana Dashboard** | Pre-built dashboard with cluster filtering |
-| ⚙️ **Configurable** | Per-CRD reconciliation intervals and strategies |
+| ⚙️ **Configurable** | Per-CRD reconciliation intervals |
+| 🔀 **Multiple Workload Types** | Supports Deployment, StatefulSet, and DaemonSet |
 
 ---
 
@@ -32,7 +33,8 @@ spec:
   reservedIPs:
     - 34.123.45.67
     - 34.123.45.68
-  deploymentRef:
+  workloadRef:
+    kind: Deployment
     name: my-app
     namespace: default
   nodeSelector:
@@ -43,9 +45,6 @@ spec:
     zones:
       - us-west1-a
       - us-west1-b
-  strategy:
-    maxSurge: 1
-    maxUnavailable: 1
   reconcileInterval: 60
 ```
 
@@ -54,15 +53,14 @@ spec:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `reservedIPs` | `[]string` | ✅ | List of static external IPs to manage |
-| `deploymentRef` | `object` | ❌ | Reference to deployment for pod-aware reallocation |
-| `deploymentRef.name` | `string` | ✅ | Deployment name |
-| `deploymentRef.namespace` | `string` | ❌ | Deployment namespace (default: `default`) |
+| `workloadRef` | `object` | ❌ | Reference to workload for pod-aware reallocation |
+| `workloadRef.kind` | `string` | ✅ | Workload type: `Deployment`, `StatefulSet`, or `DaemonSet` |
+| `workloadRef.name` | `string` | ✅ | Workload name |
+| `workloadRef.namespace` | `string` | ❌ | Workload namespace (default: `default`) |
 | `nodeSelector` | `map[string]string` | ❌ | Node labels to filter eligible nodes |
 | `cloud.provider` | `string` | ✅ | Cloud provider: `gcp`, `aws`, or `azure` |
 | `cloud.region` | `string` | ❌ | Cloud region |
 | `cloud.zones` | `[]string` | ❌ | Availability zones |
-| `strategy.maxSurge` | `int` | ❌ | Max extra IPs during reallocation |
-| `strategy.maxUnavailable` | `int` | ❌ | Max unavailable IPs during reallocation |
 | `reconcileInterval` | `int` | ❌ | Reconciliation interval in seconds (default: `30`) |
 
 ---
@@ -89,7 +87,8 @@ metadata:
 spec:
   reservedIPs:
     - 34.123.45.67
-  deploymentRef:
+  workloadRef:
+    kind: Deployment
     name: my-app
     namespace: default
   nodeSelector:
@@ -112,6 +111,38 @@ kubectl get nodes -l ip.ready=true
 # Check controller logs
 kubectl logs -l app=ip-address-controller -f
 ```
+
+---
+
+## 🔀 Workload Types
+
+The controller supports multiple Kubernetes workload types for pod-aware IP reallocation:
+
+### Deployment
+```yaml
+workloadRef:
+  kind: Deployment
+  name: my-deployment
+  namespace: default
+```
+
+### StatefulSet
+```yaml
+workloadRef:
+  kind: StatefulSet
+  name: my-statefulset
+  namespace: default
+```
+
+### DaemonSet
+```yaml
+workloadRef:
+  kind: DaemonSet
+  name: my-daemonset
+  namespace: default
+```
+
+The controller checks if pods from the referenced workload are still running on a node before detaching its IP during cordon/drain operations.
 
 ---
 
@@ -205,7 +236,6 @@ A pre-built Grafana dashboard is included with the following features:
 - **Cluster Filtering**: Optional filter when `CLUSTER_NAME` is set
 
 ### Install via ConfigMap (Grafana Sidecar)
-
 ```bash
 kubectl apply -f monitoring/grafana-dashboard-configmap.yaml
 ```
@@ -219,7 +249,6 @@ The ConfigMap uses the `grafana_dashboard: "1"` label for automatic discovery by
 3. Select your Prometheus datasource
 
 ### Dashboard Preview
-
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ IP Address Controller                                                        │
@@ -289,7 +318,7 @@ The ConfigMap uses the `grafana_dashboard: "1"` label for automatic discovery by
 ### Reallocation Flow
 
 1. **Node Cordoned** → Controller detects `spec.unschedulable: true`
-2. **Check Pods** → If deployment pods still running, keep IP
+2. **Check Pods** → If workload pods still running, keep IP
 3. **No Pods** → Detach IP from cordoned node
 4. **Find Healthy Node** → Select schedulable node matching `nodeSelector`
 5. **Attach IP** → Attach IP to new node via cloud API
@@ -360,6 +389,9 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
@@ -369,7 +401,6 @@ rules:
 ```
 
 ### PodMonitor (Prometheus Operator)
-
 ```yaml
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
@@ -445,7 +476,7 @@ kubectl get pods -l app=ip-address-controller
 
 **IPs stuck on cordoned node:**
 ```bash
-# Check if deployment pods are still running
+# Check if workload pods are still running
 kubectl get pods -o wide | grep NODE_NAME
 
 # Force reconciliation by restarting controller
@@ -473,11 +504,34 @@ kubectl logs -n monitoring -l app.kubernetes.io/name=grafana -c grafana-sc-dashb
 
 ---
 
-## 📁 Project Structure
+## 🔄 Migration from v1.0.x
 
+If you're upgrading from v1.0.x, update your CRD from `deploymentRef` to `workloadRef`:
+
+**Before (v1.0.x):**
+```yaml
+spec:
+  deploymentRef:
+    name: my-app
+    namespace: default
+```
+
+**After (v1.1.0+):**
+```yaml
+spec:
+  workloadRef:
+    kind: Deployment
+    name: my-app
+    namespace: default
+```
+
+> **Note:** The old `deploymentRef` format is still supported for backwards compatibility but is deprecated.
+
+---
+
+## 📁 Project Structure
 ```
 ip-address-controller/
-
 ├── src/
 │   ├── main.py
 │   ├── Dockerfile
