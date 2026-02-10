@@ -123,7 +123,7 @@ def start_metrics_server(port=9999, logger=None):
             logger.error(f"Failed to start metrics server: {e}")
 
 
-def set_controller_info(version="1.0.0", pod_name="unknown"):
+def set_controller_info(version="1.1.1", pod_name="unknown"):
     """Set controller info metric."""
     controller_info.info({
         'version': version,

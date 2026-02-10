@@ -93,7 +93,7 @@ LEASE_NAME = os.getenv("LEASE_NAME", "ip-address-controller-leader")
 LEASE_DURATION = int(os.getenv("LEASE_DURATION", "60"))
 SKEW_GRACE = int(os.getenv("LEASE_SKEW_GRACE_SEC", "2"))
 RENEW_EVERY = max(1, LEASE_DURATION // 3)
-CONTROLLER_VERSION = os.getenv("CONTROLLER_VERSION", "1.0.0")
+CONTROLLER_VERSION = os.getenv("CONTROLLER_VERSION", "1.1.1")
 METRICS_PORT = int(os.getenv("METRICS_PORT", "9999"))
 
 try:
