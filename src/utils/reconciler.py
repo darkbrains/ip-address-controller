@@ -381,8 +381,7 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
     logger.info("Checking for incorrectly labeled nodes", extra={"crd_name": name})
 
     try:
-        all_nodes = v1_client.list_node().items
-        for node in all_nodes:
+        for node in nodes:
             node_name = node.metadata.name
             labels = node.metadata.labels or {}
             if labels.get("ip.ready") != "true":
@@ -396,19 +395,19 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
                 )
             except Exception:
                 has_valid_ip = False
-                logger.warning("Could not validate node IPs", extra=safe_extra(node=node_name))
+                logger.warning("Could not validate node IPs", extra=safe_extra(crd_name=name, node=node_name))
 
             if not has_valid_ip:
                 logger.warning(
                     "Node is labeled ip.ready but has no valid reserved IP",
-                    extra=safe_extra(node=node_name)
+                    extra=safe_extra(crd_name=name, node=node_name)
                 )
                 try:
                     patch_node_label(v1_client, node_name, {"ip.ready": None}, crd_name=name)
-                    logger.info("Removed ip.ready label from node", extra=safe_extra(node=node_name))
+                    logger.info("Removed ip.ready label from node", extra=safe_extra(crd_name=name, node=node_name))
                     node_ip_ready.labels(node=node_name, crd_name=name).set(0)
                 except Exception:
-                    logger.error("Failed to remove ip.ready label", extra=safe_extra(node=node_name))
+                    logger.error("Failed to remove ip.ready label", extra=safe_extra(crd_name=name, node=node_name))
 
                 try:
                     if workload_ref:
@@ -434,13 +433,13 @@ def reconcile(crd, v1_client, apps_v1_client, logger):
                                             )
                                             logger.warning(
                                                 f"Evicted pod {workload_namespace}/{evict_pod_name} from invalid node",
-                                                extra=safe_extra(node=node_name)
+                                                extra=safe_extra(crd_name=name, node=node_name)
                                             )
                 except Exception:
                     tb = traceback.format_exc()
                     logger.error(
                         "Error evicting pods from invalid node",
-                        extra=safe_extra(node=node_name, trace=tb)
+                        extra=safe_extra(crd_name=name, node=node_name, trace=tb)
                     )
 
     except Exception:
